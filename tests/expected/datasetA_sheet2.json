@@ -1,0 +1,47 @@
+[
+    {
+      "vin": "1FTFW1E50JFB12345",
+      "vehicle_id": "VEH-9001",
+      "year": 2020,
+      "make": "Ford",
+      "model": "F-150",
+      "effective_date": "2024-01-01",
+      "notes": "Primary"
+    },
+    {
+      "vin": "2C3CDXBG0J123456",
+      "vehicle_id": "VEH-9002",
+      "year": 2019,
+      "make": "Dodge",
+      "model": "Charger",
+      "effective_date": "2023-06-15",
+      "notes": ""
+    },
+    {
+      "vin": "3FA6P0H74JR777777",
+      "vehicle_id": "VEH-9003",
+      "year": 2021,
+      "make": "Ford",
+      "model": "Fusion",
+      "effective_date": "2024-03-01",
+      "notes": ""
+    },
+    {
+      "vin": "5YJ3E1EA7JF888888",
+      "vehicle_id": "VEH-9004",
+      "year": 2022,
+      "make": "Tesla",
+      "model": "Model 3",
+      "effective_date": "2024-07-10",
+      "notes": "EV Fleet"
+    },
+    {
+      "vin": "JHMFA16856S999999",
+      "vehicle_id": "VEH-9005",
+      "year": 2017,
+      "make": "Honda",
+      "model": "Civic",
+      "effective_date": "2023-05-08",
+      "notes": "Lease"
+    }
+  ]
