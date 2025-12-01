@@ -1,0 +1,11 @@
+Vehicle V001: This is a 2024 Toyota Camry sedan painted blue. The VIN is HBUSRJGF4CBFPR9BN. It currently shows about 12,345 miles on the odometer. Fuel: gas, transmission is described as an 8-speed auto. Owner contact email: john.doe@example.com.
+
+Vehicle V002: This is a 2020 Ford F-150 truck painted red. The VIN is 3R5UAL4YUKPYGF1GZ. It currently shows about 45,210 miles on the odometer. Fuel: gas, transmission is described as an 8-speed auto. Owner contact email: jane.smith@example.com.
+
+Vehicle V003: This is a 2022 Tesla Model 3 sedan painted white. The VIN is ZTC6H1FV0NECRVFRG. It currently shows about 8,033 miles on the odometer. Fuel: electric, transmission is described as an 8-speed auto. Owner contact email: ev.driver@example.com.
+
+Vehicle V004: This is a 2019 Honda CR-V suv painted silver. The VIN is 1U60L0ZPUELSL61UR. It currently shows about 38,990 miles on the odometer. Fuel: gas, transmission is described as an 8-speed auto. Owner contact email: family.driver@example.com.
+
+Vehicle V005: This is a 2015 BMW 328i sedan painted black. The VIN is XDRCX2UEPXP826KTJ. It currently shows about 72,110 miles on the odometer. Fuel: gas, transmission is described as an 8-speed auto. Owner contact email: luxury.client@example.com.
+
+Another unit is described only loosely: a late-model SUV with a VIN scribbled near the bottom of the page. For testing, you might see something like VIN# 1I6978480184 mentioned once in a long paragraph.

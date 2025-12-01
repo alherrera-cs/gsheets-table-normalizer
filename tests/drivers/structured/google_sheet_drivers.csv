@@ -1,0 +1,4 @@
+Driver ID,Policy Number,First Name,Last Name,Date of Birth,Gender,Marital Status,License Number,License State,License Status,Years Licensed,Email,Phone,Address Line 1,City,State,Postal Code,Primary Driver?,Occupation,Credit Score Band
+D001,P001,John,Doe,1985-03-15,M,Married,D1234567,CA,Valid,18,john.doe@example.com,555-111-2222,123 Main St,Los Angeles,CA,90001,Yes,Software Engineer,700-749
+D002,P001,Jane,Doe,1987-07-22,F,Married,D7654321,CA,Valid,16,jane.doe@example.com,555-333-4444,123 Main St,Los Angeles,CA,90001,No,Teacher,750-799
+D_BAD1,P002,Alex,Smith,,Unknown,Single,INVALID-LIC,XX,Suspended,-1,bad-email,555-999-0000,999 Nowhere Rd,Nowhereville,ZZ,00000,Maybe,Unemployed,<600

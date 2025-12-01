@@ -1,0 +1,88 @@
+{
+  "records": [
+    {
+      "id": "recPOL001",
+      "createdTime": "2024-03-01T09:00:00.000Z",
+      "fields": {
+        "Policy #": "P001",
+        "Carrier": "BindRabbit Insurance Co.",
+        "Product": "Personal Auto",
+        "LOB": "Auto",
+        "Named Insured": "John and Jane Doe",
+        "Effective": "2025-01-01",
+        "Expiration": "2026-01-01",
+        "Status": "Active",
+        "State": "CA",
+        "Term Months": 12,
+        "Billing Plan": "Monthly",
+        "Payment Method": "EFT",
+        "Premium": 1650.5,
+        "Fees": 25.0,
+        "Total Written": 1675.5,
+        "Vehicle Count": 2,
+        "Driver Count": 2,
+        "Agency": "Main Street Agency",
+        "Producer Code": "AGT001",
+        "UW Company": "BindRabbit Auto Underwriters",
+        "Cancel Date": "",
+        "Cancel Reason": ""
+      }
+    },
+    {
+      "id": "recPOL002",
+      "createdTime": "2024-03-02T09:00:00.000Z",
+      "fields": {
+        "Policy #": "P002",
+        "Carrier": "BindRabbit Insurance Co.",
+        "Product": "High-Risk Auto",
+        "LOB": "Auto",
+        "Named Insured": "Alex Smith",
+        "Effective": "2024-06-15",
+        "Expiration": "2025-06-15",
+        "Status": "Cancelled",
+        "State": "TX",
+        "Term Months": 12,
+        "Billing Plan": "Paid in Full",
+        "Payment Method": "Credit Card",
+        "Premium": 3200.0,
+        "Fees": 50.0,
+        "Total Written": 3250.0,
+        "Vehicle Count": 1,
+        "Driver Count": 1,
+        "Agency": "Risk Specialists LLC",
+        "Producer Code": "AGT009",
+        "UW Company": "BindRabbit Non-Standard Auto",
+        "Cancel Date": "2024-10-01",
+        "Cancel Reason": "Non-payment"
+      }
+    },
+    {
+      "id": "recPOL003",
+      "createdTime": "2024-03-03T09:00:00.000Z",
+      "fields": {
+        "Policy #": "P_BAD1",
+        "Carrier": "Unknown Carrier",
+        "Product": "Something",
+        "LOB": "Auto",
+        "Named Insured": "Test Insured",
+        "Effective": "2025-12-01",
+        "Expiration": "2025-01-01",
+        "Status": "Quoted",
+        "State": "ZZ",
+        "Term Months": 0,
+        "Billing Plan": "Unknown",
+        "Payment Method": "Cash",
+        "Premium": -100.0,
+        "Fees": -5.0,
+        "Total Written": -105.0,
+        "Vehicle Count": 0,
+        "Driver Count": 0,
+        "Agency": "",
+        "Producer Code": "",
+        "UW Company": "",
+        "Cancel Date": "",
+        "Cancel Reason": ""
+      }
+    }
+  ]
+}

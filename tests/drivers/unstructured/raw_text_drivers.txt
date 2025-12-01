@@ -1,0 +1,4 @@
+Named drivers on the policy include:
+- John Doe (DOB 1985-03-15), a Software Engineer with license D1234567 issued in CA.
+- Jane Doe (DOB 1987-07-22), listed as a secondary driver. Contact emails: john.doe@example.com, jane.doe@example.com.
+One additional driver has incomplete information and a possibly invalid email and license number for testing.

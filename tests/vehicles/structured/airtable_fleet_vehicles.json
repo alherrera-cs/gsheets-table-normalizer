@@ -1,0 +1,140 @@
+{
+  "records": [
+    {
+      "id": "recVEH001",
+      "createdTime": "2024-01-01T12:00:00.000Z",
+      "fields": {
+        "VIN": "HBUSRJGF4CBFPR9BN",
+        "Vehicle Make": "Toyota",
+        "Vehicle Model": "Camry",
+        "Model Year": 2024,
+        "Color": "Blue",
+        "Current Mileage": 12345,
+        "Trim": "SE",
+        "Body Type": "sedan",
+        "Fuel": "gasoline",
+        "Transmission Type": "automatic",
+        "Owner Email": "john.doe@example.com"
+      }
+    },
+    {
+      "id": "recVEH002",
+      "createdTime": "2024-01-02T12:00:00.000Z",
+      "fields": {
+        "VIN": "3R5UAL4YUKPYGF1GZ",
+        "Vehicle Make": "Ford",
+        "Vehicle Model": "F-150",
+        "Model Year": 2020,
+        "Color": "Red",
+        "Current Mileage": 45210,
+        "Trim": "XLT",
+        "Body Type": "truck",
+        "Fuel": "gasoline",
+        "Transmission Type": "automatic",
+        "Owner Email": "jane.smith@example.com"
+      }
+    },
+    {
+      "id": "recVEH003",
+      "createdTime": "2024-01-03T12:00:00.000Z",
+      "fields": {
+        "VIN": "ZTC6H1FV0NECRVFRG",
+        "Vehicle Make": "Tesla",
+        "Vehicle Model": "Model 3",
+        "Model Year": 2022,
+        "Color": "White",
+        "Current Mileage": 8033,
+        "Trim": "Long Range",
+        "Body Type": "sedan",
+        "Fuel": "electric",
+        "Transmission Type": "automatic",
+        "Owner Email": "ev.driver@example.com"
+      }
+    },
+    {
+      "id": "recVEH004",
+      "createdTime": "2024-01-04T12:00:00.000Z",
+      "fields": {
+        "VIN": "1U60L0ZPUELSL61UR",
+        "Vehicle Make": "Honda",
+        "Vehicle Model": "CR-V",
+        "Model Year": 2019,
+        "Color": "Silver",
+        "Current Mileage": 38990,
+        "Trim": "EX-L",
+        "Body Type": "suv",
+        "Fuel": "gasoline",
+        "Transmission Type": "cvt",
+        "Owner Email": "family.driver@example.com"
+      }
+    },
+    {
+      "id": "recVEH005",
+      "createdTime": "2024-01-05T12:00:00.000Z",
+      "fields": {
+        "VIN": "XDRCX2UEPXP826KTJ",
+        "Vehicle Make": "BMW",
+        "Vehicle Model": "328i",
+        "Model Year": 2015,
+        "Color": "Black",
+        "Current Mileage": 72110,
+        "Trim": "Sport Line",
+        "Body Type": "sedan",
+        "Fuel": "gasoline",
+        "Transmission Type": "automatic",
+        "Owner Email": "luxury.client@example.com"
+      }
+    },
+    {
+      "id": "recVEH006",
+      "createdTime": "2024-01-06T12:00:00.000Z",
+      "fields": {
+        "VIN": "ST420RJ98FDHKL4E",
+        "Vehicle Make": "Nissan",
+        "Vehicle Model": "Altima",
+        "Model Year": 1899,
+        "Color": "Green",
+        "Current Mileage": -100,
+        "Trim": "S",
+        "Body Type": "crossover",
+        "Fuel": "Gas",
+        "Transmission Type": "AUTO",
+        "Owner Email": "bad-email-format"
+      }
+    },
+    {
+      "id": "recVEH007",
+      "createdTime": "2024-01-07T12:00:00.000Z",
+      "fields": {
+        "VIN": "1I6978480184",
+        "Vehicle Make": "",
+        "Vehicle Model": "Unknown",
+        "Model Year": 2035,
+        "Color": "Very Long Color Name That Exceeds Limit",
+        "Current Mileage": 1000000,
+        "Trim": "",
+        "Body Type": "boat",
+        "Fuel": "diesel",
+        "Transmission Type": "manual",
+        "Owner Email": ""
+      }
+    },
+    {
+      "id": "recVEH008",
+      "createdTime": "2024-01-08T12:00:00.000Z",
+      "fields": {
+        "VIN": "",
+        "Vehicle Make": "Chevrolet",
+        "Vehicle Model": "Impala",
+        "Model Year": 2010,
+        "Color": "",
+        "Current Mileage": 0,
+        "Trim": "Base",
+        "Body Type": "sedan",
+        "Fuel": "hybrid",
+        "Transmission Type": "cvt",
+        "Owner Email": "duplicate.owner@example.com"
+      }
+    }
+  ]
+}

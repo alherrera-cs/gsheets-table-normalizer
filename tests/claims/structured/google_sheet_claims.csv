@@ -1,0 +1,3 @@
+Claim Number,Policy Number,Loss Date,Report Date,Cause of Loss,Loss Description,Claim Status,Open/Closed,Total Incurred,Paid,Reserved,Adjuster Name,Adjuster Email,Litigation Flag
+CLM001,P001,2025-02-10,2025-02-11,Rear-end collision,Insured rear-ended another vehicle at a stop light.,Open,Open,8800.0,1500.0,7300.0,Casey Adjuster,casey.adjuster@example.com,No
+CLM002,P002,2024-08-01,2024-08-15,Single vehicle rollover,Insured lost control on wet road; vehicle rolled once.,Closed,Closed,22000.0,22000.0,0.0,Riley Adjuster,riley.adjuster@example.com,Yes

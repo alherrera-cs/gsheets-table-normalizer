@@ -6,8 +6,22 @@ Converts raw 2D tables → normalized list of dicts → mapped → cleaned.
 import os
 from pathlib import Path
 
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
+# Google Sheets imports - only needed for Google Sheets functionality
+try:
+    from google.oauth2 import service_account
+    from googleapiclient.discovery import build
+    GOOGLE_SHEETS_AVAILABLE = True
+except ImportError:
+    GOOGLE_SHEETS_AVAILABLE = False
+    # Dummy classes for type hints
+    class service_account:
+        @staticmethod
+        def Credentials(*args, **kwargs):
+            raise ImportError("google.oauth2 not available")
+    class build:
+        @staticmethod
+        def __call__(*args, **kwargs):
+            raise ImportError("googleapiclient not available")
 
 from mappings import get_mapping
 
@@ -18,6 +32,11 @@ SERVICE_ACCOUNT_FILE = os.getenv(
     str(PROJECT_ROOT / "cosmic-bonus-434805-m6-0d79573ad277.json"),
 )
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+
+# Only define these if Google Sheets is available
+if not GOOGLE_SHEETS_AVAILABLE:
+    SERVICE_ACCOUNT_FILE = None
+    SCOPES = []
 
 
 def clean_header(h: str) -> str:

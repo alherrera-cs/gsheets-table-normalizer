@@ -1,0 +1,9 @@
+VIN Number,Make,Model,Year,Exterior Color,Mileage,Trim Level,Body Style,Fuel Type,Transmission,Owner Email
+HBUSRJGF4CBFPR9BN,Toyota,Camry,2024,Blue,12345,SE,sedan,gasoline,automatic,john.doe@example.com
+3R5UAL4YUKPYGF1GZ,Ford,F-150,2020,Red,45210,XLT,truck,gasoline,automatic,jane.smith@example.com
+ZTC6H1FV0NECRVFRG,Tesla,Model 3,2022,White,8033,Long Range,sedan,electric,automatic,ev.driver@example.com
+1U60L0ZPUELSL61UR,Honda,CR-V,2019,Silver,38990,EX-L,suv,gasoline,cvt,family.driver@example.com
+XDRCX2UEPXP826KTJ,BMW,328i,2015,Black,72110,Sport Line,sedan,gasoline,automatic,luxury.client@example.com
+ST420RJ98FDHKL4E,Nissan,Altima,1899,Green,-100,S,crossover,Gas,AUTO,bad-email-format
+1I6978480184,,Unknown,2035,Very Long Color Name That Exceeds Limit,1000000,,boat,diesel,manual,
+,Chevrolet,Impala,2010,,0,Base,sedan,hybrid,cvt,duplicate.owner@example.com

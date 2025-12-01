@@ -1,0 +1,4 @@
+Policy Number,Carrier,Product,Line of Business,Named Insured,Effective Date,Expiration Date,Status,State,Term (months),Billing Plan,Payment Method,Policy Premium,Fees,Total Written Premium,Number of Vehicles,Number of Drivers,Agency Name,Producer Code,Underwriting Company,Cancellation Date,Cancellation Reason
+P001,BindRabbit Insurance Co.,Personal Auto,Auto,John and Jane Doe,2025-01-01,2026-01-01,Active,CA,12,Monthly,EFT,1650.5,25.0,1675.5,2,2,Main Street Agency,AGT001,BindRabbit Auto Underwriters,,
+P002,BindRabbit Insurance Co.,High-Risk Auto,Auto,Alex Smith,2024-06-15,2025-06-15,Cancelled,TX,12,Paid in Full,Credit Card,3200.0,50.0,3250.0,1,1,Risk Specialists LLC,AGT009,BindRabbit Non-Standard Auto,2024-10-01,Non-payment
+P_BAD1,Unknown Carrier,Something,Auto,Test Insured,2025-12-01,2025-01-01,Quoted,ZZ,0,Unknown,Cash,-100.0,-5.0,-105.0,0,0,,,,,

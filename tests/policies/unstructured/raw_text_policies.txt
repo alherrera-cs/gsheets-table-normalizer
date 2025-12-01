@@ -1,0 +1,4 @@
+Policy narrative examples:
+Policy P001 is an active personal auto policy in CA for John and Jane Doe, with two vehicles and two drivers, billed monthly via EFT.
+Policy P002 is a high-risk auto policy in TX for Alex Smith, which was cancelled mid-term for non-payment.
+P_BAD1 is a deliberately inconsistent quote record with reversed effective/expiration dates and negative premium values.

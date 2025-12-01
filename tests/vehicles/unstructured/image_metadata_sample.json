@@ -1,0 +1,35 @@
+{
+  "notes": "Placeholder metadata for vehicle images. Replace image_url values with real test images.",
+  "records": [
+    {
+      "vehicle_id": "V001",
+      "vin": "HBUSRJGF4CBFPR9BN",
+      "image_url": "https://example.com/test-images/v001-front.jpg",
+      "description": "Front 3/4 view with license plate and potential VIN sticker visible on windshield."
+    },
+    {
+      "vehicle_id": "V002",
+      "vin": "3R5UAL4YUKPYGF1GZ",
+      "image_url": "https://example.com/test-images/v002-front.jpg",
+      "description": "Front 3/4 view with license plate and potential VIN sticker visible on windshield."
+    },
+    {
+      "vehicle_id": "V003",
+      "vin": "ZTC6H1FV0NECRVFRG",
+      "image_url": "https://example.com/test-images/v003-front.jpg",
+      "description": "Front 3/4 view with license plate and potential VIN sticker visible on windshield."
+    },
+    {
+      "vehicle_id": "V004",
+      "vin": "1U60L0ZPUELSL61UR",
+      "image_url": "https://example.com/test-images/v004-front.jpg",
+      "description": "Front 3/4 view with license plate and potential VIN sticker visible on windshield."
+    },
+    {
+      "vehicle_id": "V005",
+      "vin": "XDRCX2UEPXP826KTJ",
+      "image_url": "https://example.com/test-images/v005-front.jpg",
+      "description": "Front 3/4 view with license plate and potential VIN sticker visible on windshield."
+    }
+  ]
+}
