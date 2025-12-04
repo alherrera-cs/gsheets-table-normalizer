@@ -11,7 +11,7 @@ import uuid
 import re
 
 from sources import SourceType, detect_source_type, extract_from_source
-# from transforms import apply_transform  # Transform logic will be implemented later
+from transforms import apply_transform
 from schema import validate_schema, FieldType, ValidationError
 from external_tables import (
     clean_header,
@@ -199,10 +199,32 @@ def normalize_v2(
                     # The error will be added after all variants are tried (at the end of mapping loop)
                     pass
                 
-                # Apply transforms - transform logic will be implemented later
+                # Apply transforms - runs AFTER raw value extraction, BEFORE type conversion
+                # Transform receives the entire raw row dict as context
                 if transform:
-                    # TODO: Implement transform logic
-                    pass  # Transform will be applied here once implemented
+                    try:
+                        transform_result = apply_transform(row, transform)
+                        if transform_result.error:
+                            # Transform failed - append error but continue with original value
+                            row_errors.append({
+                                "target_field": target_field,
+                                "_source_id": mapping_id,
+                                "_source_row_number": row_idx,
+                                "error": f"Transform error: {transform_result.error}"
+                            })
+                            # Continue using original extracted value
+                        else:
+                            # Transform succeeded - use transformed value
+                            value = transform_result.value
+                    except Exception as e:
+                        # Unexpected error during transform - append error but continue with original value
+                        row_errors.append({
+                            "target_field": target_field,
+                            "_source_id": mapping_id,
+                            "_source_row_number": row_idx,
+                            "error": f"Transform exception: {str(e)}"
+                        })
+                        # Continue using original extracted value
                 
                 if format_spec:
                     # TODO: Implement format specification logic
