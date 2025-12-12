@@ -80,6 +80,8 @@ def parse_and_apply_transform(data: Dict[str, Any], transform_string: str) -> Tr
         'boolean': apply_boolean,
         'if': apply_if,
         'flatten': apply_flatten,
+        'standardize_fuel_type': apply_standardize_fuel_type,
+        'combine_image_metadata_notes': apply_combine_image_metadata_notes,
     }
     
     transform_func = transforms.get(function_name.lower())
@@ -822,6 +824,75 @@ def apply_flatten(data: Dict[str, Any], args: List[str]) -> TransformResult:
             values.append(str(v))
         
         return TransformResult(separator.join(values))
+
+
+def apply_combine_image_metadata_notes(data: Dict[str, Any], args: List[str]) -> TransformResult:
+    """
+    Combine image_url + description into a clean notes string.
+    Should output: "Image: <url> | Desc: <desc>"
+    Must NOT include 'None' anywhere.
+    """
+    if len(args) != 0:
+        return TransformResult('', 'combine_image_metadata_notes() takes no arguments')
+    
+    image_url = data.get("image_url")
+    description = data.get("description")
+    
+    # Clean inputs - filter out None, empty strings, and the literal string "None"
+    cleaned_url = None
+    cleaned_desc = None
+    
+    if image_url is not None:
+        url_str = str(image_url).strip()
+        if url_str != "" and url_str.lower() != "none":
+            cleaned_url = url_str
+    
+    if description is not None:
+        desc_str = str(description).strip()
+        if desc_str != "" and desc_str.lower() != "none":
+            cleaned_desc = desc_str
+    
+    # Build result - only include parts that are valid
+    parts = []
+    if cleaned_url:
+        parts.append(f"Image: {cleaned_url}")
+    if cleaned_desc:
+        parts.append(f"Desc: {cleaned_desc}")
+    
+    if not parts:
+        return TransformResult("")
+    
+    result = " | ".join(parts)
+    return TransformResult(result)
+
+
+def apply_standardize_fuel_type(data: Dict[str, Any], args: List[str]) -> TransformResult:
+    """
+    Standardizes fuel type values to canonical forms.
+    Converts: "Gas", "gas", "GAS" → "gasoline"
+    Keeps: "diesel", "electric", "hybrid", "plug-in hybrid" as-is (lowercase)
+    """
+    if len(args) != 1:
+        return TransformResult('', 'standardize_fuel_type() requires exactly 1 argument')
+    
+    value = get_value(data, args[0])
+    
+    if value is None or value == '':
+        return TransformResult('')
+    
+    value_str = str(value).strip()
+    value_lower = value_str.lower()
+    
+    # Normalize "gas" or "gasoline" to "gasoline"
+    if value_lower in ["gas", "gasoline"]:
+        return TransformResult("gasoline")
+    
+    # Keep other valid fuel types as lowercase
+    if value_lower in ["diesel", "electric", "hybrid", "plug-in hybrid"]:
+        return TransformResult(value_lower)
+    
+    # Return original value if not recognized (will trigger validation warning)
+    return TransformResult(value_str)
 
 
 # Date/Time helper functions

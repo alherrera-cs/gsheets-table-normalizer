@@ -30,7 +30,7 @@ VEHICLES_MAPPINGS = [
                     "min_length": 17,
                     "max_length": 17
                 },
-                # "transform": "uppercase"  # Transform logic will be implemented later
+                "transform": "uppercase"
             },
             {
                 "target_field": "vin",
@@ -80,7 +80,6 @@ VEHICLES_MAPPINGS = [
                     "min_length": 2,
                     "max_length": 50
                 }
-                # "transform": "uppercase"  # Transform logic will be implemented later
             },
             {
                 "target_field": "make",
@@ -134,7 +133,6 @@ VEHICLES_MAPPINGS = [
                 "validation": {
                     "max_length": 30
                 }
-                # "transform": "capitalize"  # Transform logic will be implemented later
             },
             {
                 "target_field": "color",
@@ -188,7 +186,6 @@ VEHICLES_MAPPINGS = [
                 "validation": {
                     "enum": ["sedan", "coupe", "suv", "truck", "van", "convertible", "wagon", "hatchback", "crossover", "boat"]
                 }
-                # "transform": "lowercase"  # Transform logic will be implemented later
             },
             {
                 "target_field": "body_style",
@@ -205,16 +202,17 @@ VEHICLES_MAPPINGS = [
                 "source_field": "Fuel Type",
                 "type": "string",
                 "required": False,
+                "transform": "standardize_fuel_type",
                 "validation": {
                     "enum": ["gasoline", "diesel", "electric", "hybrid", "plug-in hybrid", "Gas"]
                 }
-                # "transform": "lowercase"  # Transform logic will be implemented later
             },
             {
                 "target_field": "fuel_type",
                 "source_field": "Fuel",
                 "type": "string",
                 "required": False,
+                "transform": "standardize_fuel_type",
                 "validation": {
                     "enum": ["gasoline", "diesel", "electric", "hybrid", "plug-in hybrid", "Gas"]
                 }
@@ -228,7 +226,6 @@ VEHICLES_MAPPINGS = [
                 "validation": {
                     "enum": ["automatic", "manual", "cvt", "AUTO"]
                 }
-                # "transform": "lowercase"  # Transform logic will be implemented later
             },
             {
                 "target_field": "transmission",
@@ -247,8 +244,8 @@ VEHICLES_MAPPINGS = [
                 "flag": ["pii"],
                 "validation": {
                     "pattern": r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$"
-                }
-                # "transform": "lowercase"  # Transform logic will be implemented later
+                },
+                "transform": "lowercase"
             },
             {
                 "target_field": "weight",
@@ -285,8 +282,8 @@ VEHICLES_MAPPINGS = [
                     "pattern": r"^[A-HJ-NPR-Z0-9]{17}$",
                     "min_length": 17,
                     "max_length": 17
-                }
-                # "transform": "uppercase"  # Transform logic will be implemented later
+                },
+                "transform": "uppercase"
             },
             {
                 "target_field": "vehicle_id",
@@ -342,6 +339,70 @@ VEHICLES_MAPPINGS = [
                 "type": "string",
                 "required": False
             },
+            # Color
+            {
+                "target_field": "color",
+                "source_field": "Color",
+                "type": "string",
+                "required": False,
+                "validation": {
+                    "max_length": 30
+                }
+            },
+            # Mileage
+            {
+                "target_field": "mileage",
+                "source_field": "Current Mileage",
+                "type": "integer",
+                "required": False,
+                "validation": {
+                    "min": 0,
+                    "max": 999999
+                }
+            },
+            # Body Style
+            {
+                "target_field": "body_style",
+                "source_field": "Body Type",
+                "type": "string",
+                "required": False,
+                "validation": {
+                    "enum": ["sedan", "coupe", "suv", "truck", "van", "convertible", "wagon", "hatchback", "crossover", "boat"]
+                }
+            },
+            # Fuel Type
+            {
+                "target_field": "fuel_type",
+                "source_field": "Fuel",
+                "type": "string",
+                "required": False,
+                "transform": "standardize_fuel_type",
+                "validation": {
+                    "enum": ["gasoline", "diesel", "electric", "hybrid", "plug-in hybrid", "Gas"]
+                }
+            },
+            # Transmission
+            {
+                "target_field": "transmission",
+                "source_field": "Transmission Type",
+                "type": "string",
+                "required": False,
+                "validation": {
+                    "enum": ["automatic", "manual", "cvt", "AUTO"]
+                }
+            },
+            # Owner Email
+            {
+                "target_field": "owner_email",
+                "source_field": "Owner Email",
+                "type": "email",
+                "required": False,
+                "flag": ["pii"],
+                "validation": {
+                    "pattern": r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$"
+                },
+                "transform": "lowercase"
+            },
             {
                 "target_field": "weight",
                 "source_field": "Weight",
@@ -368,27 +429,29 @@ VEHICLES_MAPPINGS = [
             }
         },
         "mappings": [
+            # VIN - multiple variants (Excel: "VIN Number")
             {
                 "target_field": "vin",
-                "source_field": "VIN_NUMBER",
+                "source_field": "VIN Number",
                 "type": "string",
                 "required": True,
                 "validation": {
                     "pattern": r"^[A-HJ-NPR-Z0-9]{17}$",
                     "min_length": 17,
                     "max_length": 17
-                }
-                # "transform": "uppercase"  # Transform logic will be implemented later
+                },
+                "transform": "uppercase"
             },
             {
                 "target_field": "vehicle_id",
-                "source_field": "VEHICLE_ID",
+                "source_field": "Vehicle ID",
                 "type": "string",
                 "required": False
             },
+            # Year
             {
                 "target_field": "year",
-                "source_field": "YEAR",
+                "source_field": "Year",
                 "type": "integer",
                 "required": True,
                 "validation": {
@@ -396,9 +459,10 @@ VEHICLES_MAPPINGS = [
                     "max": 2030
                 }
             },
+            # Make
             {
                 "target_field": "make",
-                "source_field": "MAKE",
+                "source_field": "Make",
                 "type": "string",
                 "required": True,
                 "validation": {
@@ -406,9 +470,10 @@ VEHICLES_MAPPINGS = [
                     "max_length": 50
                 }
             },
+            # Model
             {
                 "target_field": "model",
-                "source_field": "MODEL",
+                "source_field": "Model",
                 "type": "string",
                 "required": True,
                 "validation": {
@@ -418,25 +483,89 @@ VEHICLES_MAPPINGS = [
             },
             {
                 "target_field": "effective_date",
-                "source_field": "EFFECTIVE_DATE",
+                "source_field": "Effective Date",
                 "type": "date",
                 "required": False
             },
             {
                 "target_field": "notes",
-                "source_field": "NOTES",
+                "source_field": "Notes",
                 "type": "string",
                 "required": False
             },
+            # Color
+            {
+                "target_field": "color",
+                "source_field": "Exterior Color",
+                "type": "string",
+                "required": False,
+                "validation": {
+                    "max_length": 30
+                }
+            },
+            # Mileage
+            {
+                "target_field": "mileage",
+                "source_field": "Mileage",
+                "type": "integer",
+                "required": False,
+                "validation": {
+                    "min": 0,
+                    "max": 999999
+                }
+            },
+            # Trim
             {
                 "target_field": "trim",
-                "source_field": "TRIM_LEVEL",
+                "source_field": "Trim Level",
                 "type": "string",
                 "required": False
+            },
+            # Body Style
+            {
+                "target_field": "body_style",
+                "source_field": "Body Style",
+                "type": "string",
+                "required": False,
+                "validation": {
+                    "enum": ["sedan", "coupe", "suv", "truck", "van", "convertible", "wagon", "hatchback", "crossover", "boat"]
+                }
+            },
+            # Fuel Type
+            {
+                "target_field": "fuel_type",
+                "source_field": "Fuel Type",
+                "type": "string",
+                "required": False,
+                "transform": "standardize_fuel_type",
+                "validation": {
+                    "enum": ["gasoline", "diesel", "electric", "hybrid", "plug-in hybrid", "Gas"]
+                }
+            },
+            # Transmission
+            {
+                "target_field": "transmission",
+                "source_field": "Transmission",
+                "type": "string",
+                "required": False,
+                "validation": {
+                    "enum": ["automatic", "manual", "cvt", "AUTO"]
+                }
+            },
+            {
+                "target_field": "owner_email",
+                "source_field": "Owner Email",
+                "type": "email",
+                "required": False,
+                "flag": ["pii"],
+                "validation": {
+                    "pattern": r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$"
+                },
+                "transform": "lowercase"
             },
             {
                 "target_field": "weight",
-                "source_field": "WEIGHT",
+                "source_field": "Weight",
                 "type": "integer",
                 "required": False,
                 "validation": {
@@ -469,7 +598,7 @@ VEHICLES_MAPPINGS = [
                     "min_length": 17,
                     "max_length": 17
                 },
-                # "transform": "uppercase"  # Transform logic will be implemented later
+                "transform": "uppercase",
                 "ai_instruction": "Extract the Vehicle Identification Number (VIN) from the document. Look for a 17-character alphanumeric code, often labeled as 'VIN', 'VIN Number', 'Vehicle Identification Number', or found near vehicle details. The VIN excludes the letters I, O, and Q to avoid confusion with numbers."
             },
             {
@@ -492,7 +621,6 @@ VEHICLES_MAPPINGS = [
                     "min_length": 2,
                     "max_length": 50
                 },
-                # "transform": "uppercase"  # Transform logic will be implemented later
                 "ai_instruction": "Extract the vehicle manufacturer or make (e.g., Toyota, Ford, Honda, BMW). Look for labels like 'Make', 'Manufacturer', 'Brand', or in the vehicle description section."
             },
             {
@@ -518,7 +646,95 @@ VEHICLES_MAPPINGS = [
                 "source_field": "",
                 "type": "string",
                 "required": False,
-                "ai_instruction": "Extract any additional notes or comments about the vehicle from the document."
+                "ai_instruction": "Extract ONLY the vehicle-specific notes.\n\nRULES:\n- Keep each sentence EXACTLY once\n- Remove bullets ('-', '*', '•') and list format\n- Keep original ordering\n- No duplication\n- Output a clean paragraph, not a list"
+            },
+            {
+                "target_field": "vehicle_id",
+                "source_field": "",
+                "type": "string",
+                "required": False,
+                "ai_instruction": "Extract the vehicle ID if present. Look for labels like 'Vehicle ID', 'ID', 'Vehicle Number', or similar identifiers."
+            },
+            {
+                "target_field": "color",
+                "source_field": "",
+                "type": "string",
+                "required": False,
+                "validation": {
+                    "max_length": 30
+                },
+                "ai_instruction": "Extract the vehicle color. Look for labels like 'Color', 'Exterior Color', 'Paint Color', or color descriptions in the vehicle details."
+            },
+            {
+                "target_field": "mileage",
+                "source_field": "",
+                "type": "integer",
+                "required": False,
+                "validation": {
+                    "min": 0,
+                    "max": 999999
+                },
+                "ai_instruction": "Extract the vehicle mileage/odometer reading. Look for labels like 'Mileage', 'Odometer', 'Current Mileage', or numeric values with units like 'miles' or 'mi'."
+            },
+            {
+                "target_field": "trim",
+                "source_field": "",
+                "type": "string",
+                "required": False,
+                "ai_instruction": "Extract the vehicle trim level (e.g., SE, XLT, EX-L, Sport Line). Look for labels like 'Trim', 'Trim Level', 'Package', or in the model description."
+            },
+            {
+                "target_field": "body_style",
+                "source_field": "",
+                "type": "string",
+                "required": False,
+                "transform": "lowercase",
+                "validation": {
+                    "enum": ["sedan", "coupe", "suv", "truck", "van", "convertible", "wagon", "hatchback", "crossover", "boat"]
+                },
+                "ai_instruction": "Extract the vehicle body style (e.g., sedan, truck, SUV, coupe). Look for labels like 'Body Style', 'Body Type', 'Type', or infer from vehicle description."
+            },
+            {
+                "target_field": "fuel_type",
+                "source_field": "",
+                "type": "string",
+                "required": False,
+                "transform": "standardize_fuel_type",
+                "validation": {
+                    "enum": ["gasoline", "diesel", "electric", "hybrid", "plug-in hybrid", "Gas", "gas"]
+                },
+                "ai_instruction": "Extract the fuel type (e.g., gas, gasoline, diesel, electric, hybrid). Look for labels like 'Fuel Type', 'Fuel', 'Engine Type', or in vehicle specifications. Return the raw value as written - normalization will be applied."
+            },
+            {
+                "target_field": "transmission",
+                "source_field": "",
+                "type": "string",
+                "required": False,
+                "transform": "lowercase",
+                "validation": {
+                    "enum": ["automatic", "manual", "cvt", "AUTO"]
+                },
+                "ai_instruction": "Extract the transmission type (e.g., automatic, manual, CVT). Look for labels like 'Transmission', 'Transmission Type', 'Trans', or in vehicle specifications."
+            },
+            {
+                "target_field": "owner_email",
+                "source_field": "",
+                "type": "string",
+                "required": False,
+                "flag": ["pii"],
+                "transform": "lowercase",
+                "ai_instruction": "Extract the owner's email EXACTLY as written.\n- ALWAYS return the literal string, even if invalid\n- NEVER return null or empty\n- Do NOT guess or correct the format"
+            },
+            {
+                "target_field": "weight",
+                "source_field": "",
+                "type": "integer",
+                "required": False,
+                "validation": {
+                    "min": 0,
+                    "max": 99999
+                },
+                "ai_instruction": "Extract the vehicle weight if present. Look for labels like 'Weight', 'Curb Weight', 'Gross Weight', or numeric values with units like 'lbs' or 'kg'."
             }
         ]
     },
@@ -545,8 +761,8 @@ VEHICLES_MAPPINGS = [
                     "min_length": 17,
                     "max_length": 17
                 },
-                # "transform": "uppercase"  # Transform logic will be implemented later
-                "ai_instruction": "Search the text for a 17-character Vehicle Identification Number (VIN). It may be mentioned explicitly with keywords like 'VIN:', 'VIN number:', 'Vehicle ID:', or may appear as a standalone 17-character alphanumeric string. Remember VINs do not contain the letters I, O, or Q."
+                "transform": "uppercase",
+                "ai_instruction": "Extract the VIN for THIS vehicle only.\nIgnore all example/template VINs in the document."
             },
             {
                 "target_field": "year",
@@ -557,7 +773,7 @@ VEHICLES_MAPPINGS = [
                     "min": 1900,
                     "max": 2030
                 },
-                "ai_instruction": "Extract the model year of the vehicle. Look for a 4-digit year near the vehicle description, often mentioned as 'year', model year, or as a prefix to the make/model (e.g., '2023 Toyota Camry')."
+                "ai_instruction": "Extract the model year of the vehicle from the actual vehicle description. Look for a 4-digit year in the vehicle description itself (e.g., '2024 Toyota Camry', '2020 Ford F-150'). Do NOT extract years from prefixes like 'Vehicle V001:' - only extract the year from the actual vehicle description."
             },
             {
                 "target_field": "make",
@@ -568,7 +784,7 @@ VEHICLES_MAPPINGS = [
                     "min_length": 2,
                     "max_length": 50
                 },
-                "ai_instruction": "Identify the vehicle manufacturer/make from the text. Look for brand names like Toyota, Ford, Honda, Chevrolet, BMW, Mercedes, etc. The make is typically mentioned before the model name in vehicle descriptions."
+                "ai_instruction": "Extract the make for THIS vehicle.\nIgnore example text above the actual entry."
             },
             {
                 "target_field": "model",
@@ -579,7 +795,7 @@ VEHICLES_MAPPINGS = [
                     "min_length": 1,
                     "max_length": 50
                 },
-                "ai_instruction": "Identify the vehicle model from the text. The model typically follows the make (e.g., 'Toyota Camry' - Camry is the model). Look for model names in the context of vehicle descriptions."
+                "ai_instruction": "Extract the model for THIS vehicle.\nDo NOT reuse or infer from example blocks."
             },
             {
                 "target_field": "effective_date",
@@ -593,7 +809,72 @@ VEHICLES_MAPPINGS = [
                 "source_field": "",
                 "type": "string",
                 "required": False,
-                "ai_instruction": "Extract any additional notes or comments about the vehicle from the text."
+                "ai_instruction": "Extract the descriptive text ONLY for THIS vehicle.\n- Ignore all example blocks\n- Ignore template text\n- Do NOT copy text from previous vehicles\n- Produce one clean narrative sentence"
+            },
+            {
+                "target_field": "color",
+                "source_field": "",
+                "type": "string",
+                "required": False,
+                "validation": {
+                    "max_length": 30
+                },
+                "ai_instruction": "Extract the vehicle color from the text. Look for color descriptions like 'painted blue', 'red', 'white', 'black', 'silver', etc."
+            },
+            {
+                "target_field": "mileage",
+                "source_field": "",
+                "type": "integer",
+                "required": False,
+                "validation": {
+                    "min": 0,
+                    "max": 999999
+                },
+                "ai_instruction": "Extract the vehicle mileage/odometer reading from the text. Look for patterns like '12,345 miles', 'about 45,210 miles', or 'X miles on the odometer'."
+            },
+            {
+                "target_field": "body_style",
+                "source_field": "",
+                "type": "string",
+                "required": False,
+                "transform": "lowercase",
+                "validation": {
+                    "enum": ["sedan", "coupe", "suv", "truck", "van", "convertible", "wagon", "hatchback", "crossover", "boat"]
+                },
+                "ai_instruction": "Extract the vehicle body style from the text. Look for terms like 'sedan', 'truck', 'SUV', 'crossover', 'coupe', etc."
+            },
+            {
+                "target_field": "fuel_type",
+                "source_field": "",
+                "type": "string",
+                "required": False,
+                "transform": "standardize_fuel_type",
+                "validation": {
+                    "enum": ["gasoline", "diesel", "electric", "hybrid", "plug-in hybrid", "Gas"]
+                },
+                "ai_instruction": "Extract the fuel type from the text. Look for patterns like 'Fuel: gas', 'Fuel: electric', etc. Return the raw value (normalization will be applied)."
+            },
+            {
+                "target_field": "transmission",
+                "source_field": "",
+                "type": "string",
+                "required": False,
+                "transform": "lowercase",
+                "validation": {
+                    "enum": ["automatic", "manual", "cvt", "AUTO"]
+                },
+                "ai_instruction": "Extract the transmission type from the text. Look for patterns like '8-speed auto', 'automatic', 'manual', 'CVT', etc."
+            },
+            {
+                "target_field": "owner_email",
+                "source_field": "",
+                "type": "email",
+                "required": False,
+                "flag": ["pii"],
+                "validation": {
+                    "pattern": r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$"
+                },
+                "ai_instruction": "Extract the owner email address from the text. Look for patterns like 'Owner contact email: X' or standalone email addresses."
             }
         ]
     },
@@ -611,8 +892,14 @@ VEHICLES_MAPPINGS = [
         },
         "mappings": [
             {
+                "target_field": "vehicle_id",
+                "source_field": "vehicle_id",
+                "type": "string",
+                "required": False
+            },
+            {
                 "target_field": "vin",
-                "source_field": "",
+                "source_field": "vin",
                 "type": "string",
                 "required": True,
                 "validation": {
@@ -620,8 +907,7 @@ VEHICLES_MAPPINGS = [
                     "min_length": 17,
                     "max_length": 17
                 },
-                # "transform": "uppercase"  # Transform logic will be implemented later
-                "ai_instruction": "Analyze the image for a Vehicle Identification Number (VIN). The VIN is a 17-character code that may appear: on a window sticker, on a registration card, on the vehicle's dashboard (visible through windshield), on the driver's door jamb sticker, or in any documents visible in the image. Use OCR to extract the 17-character alphanumeric sequence, excluding letters I, O, and Q."
+                "transform": "uppercase"
             },
             {
                 "target_field": "year",
@@ -668,7 +954,58 @@ VEHICLES_MAPPINGS = [
                 "source_field": "",
                 "type": "string",
                 "required": False,
-                "ai_instruction": "Extract any additional notes or comments about the vehicle visible in the image or documents."
+                "transform": "combine_image_metadata_notes"
+            },
+        ]
+    },
+    {
+        "id": "source_image_metadata_json_vehicles",
+        "metadata": {
+            "source_name": "Image Metadata JSON",
+            "source_type": "airtable",
+            "connection_type": "file_upload",
+            "notes": "Simple JSON file with image metadata (image_url, description) for vehicle records",
+            "connection_config": {
+                "file_path": ""
+            }
+        },
+        "mappings": [
+            {
+                "target_field": "vehicle_id",
+                "source_field": "vehicle_id",
+                "type": "string",
+                "required": False
+            },
+            {
+                "target_field": "vin",
+                "source_field": "vin",
+                "type": "string",
+                "required": True,
+                "validation": {
+                    "pattern": r"^[A-HJ-NPR-Z0-9]{17}$",
+                    "min_length": 17,
+                    "max_length": 17
+                },
+                "transform": "uppercase"
+            },
+            {
+                "target_field": "image_url",
+                "source_field": "image_url",
+                "type": "string",
+                "required": False
+            },
+            {
+                "target_field": "description",
+                "source_field": "description",
+                "type": "string",
+                "required": False
+            },
+            {
+                "target_field": "notes",
+                "source_field": "",
+                "type": "string",
+                "required": False,
+                "transform": "combine_image_metadata_notes"
             }
         ]
     }

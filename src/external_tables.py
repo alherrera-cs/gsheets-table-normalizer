@@ -54,6 +54,68 @@ def clean_header(h: str) -> str:
     return h.strip().lower().replace(" ", "_")
 
 
+def normalize_header(header: str) -> str:
+    """
+    Normalize CSV header names to a standardized format.
+    
+    Applies the following transformations:
+    - strip whitespace
+    - lowercase everything
+    - replace spaces with underscores
+    - replace hyphens with underscores
+    - remove trailing colons
+    - remove non-alphanumeric characters except underscores
+    - apply header aliases to map common variants to canonical names
+    
+    Args:
+        header: Raw header string from CSV
+        
+    Returns:
+        Normalized header string
+        
+    Examples:
+        "VIN Number" → "vin" (via alias mapping)
+        "VIN" → "vin"
+        "Exterior Color" → "exterior_color"
+        "Owner Email" → "owner_email"
+        "Fuel Type" → "fuel_type"
+        "Trim Level" → "trim_level"
+        "Field:" → "field"
+    """
+    if not header:
+        return ""
+    
+    # Convert to string and strip whitespace
+    normalized = str(header).strip()
+    
+    # Lowercase everything
+    normalized = normalized.lower()
+    
+    # Replace spaces with underscores
+    normalized = normalized.replace(" ", "_")
+    
+    # Replace hyphens with underscores
+    normalized = normalized.replace("-", "_")
+    
+    # Remove trailing colons
+    normalized = normalized.rstrip(":")
+    
+    # Remove non-alphanumeric characters except underscores
+    normalized = "".join(c if c.isalnum() or c == "_" else "" for c in normalized)
+    
+    # Apply header aliases to map common variants to canonical names
+    # This ensures variants like "VIN Number", "VINNumber", etc. all map to "vin"
+    header_aliases = {
+        "vin_number": "vin",
+        "vinnumber": "vin",
+        "vehicle_identification_number": "vin",
+        "vinno": "vin"
+    }
+    
+    # Return the alias if it exists, otherwise return the normalized key
+    return header_aliases.get(normalized, normalized)
+
+
 def rows2d_to_objects(values, header_row_index=0):
     """
     Convert a 2D list/array to a list of dictionaries.
@@ -68,8 +130,9 @@ def rows2d_to_objects(values, header_row_index=0):
     if not values or len(values) <= header_row_index:
         return []
     
-    # Get headers and clean them
-    headers = [clean_header(str(h)) for h in values[header_row_index]]
+    # Get headers and normalize them using normalize_header()
+    # This ensures all headers are normalized before creating row dictionaries
+    headers = [normalize_header(str(h)) for h in values[header_row_index]]
     
     # Get data rows (everything after header row)
     data_rows = values[header_row_index + 1:]

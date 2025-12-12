@@ -1,0 +1,59 @@
+{
+  "__schema__": [
+    "driver_id",
+    "first_name",
+    "last_name",
+    "date_of_birth",
+    "license_number",
+    "license_state",
+    "license_status",
+    "years_experience",
+    "violations_count",
+    "training_completed",
+    "notes"
+  ],
+  "rows": [
+    {
+      "driver_id": "D001",
+      "first_name": "John",
+      "last_name": "Doe",
+      "date_of_birth": "1985-03-15",
+      "license_number": "D1234567",
+      "license_state": "CA",
+      "license_status": null,
+      "years_experience": null,
+      "violations_count": null,
+      "training_completed": null,
+      "notes": "Software Engineer",
+      "_warnings": []
+    },
+    {
+      "driver_id": "D002",
+      "first_name": "Jane",
+      "last_name": "Doe",
+      "date_of_birth": "1987-07-22",
+      "license_number": null,
+      "license_state": null,
+      "license_status": null,
+      "years_experience": null,
+      "violations_count": null,
+      "training_completed": null,
+      "notes": "Secondary driver",
+      "_warnings": []
+    },
+    {
+      "driver_id": "D003",
+      "first_name": null,
+      "last_name": null,
+      "date_of_birth": null,
+      "license_number": null,
+      "license_state": null,
+      "license_status": null,
+      "years_experience": null,
+      "violations_count": null,
+      "training_completed": null,
+      "notes": "Incomplete driver record with invalid or missing fields",
+      "_warnings": []
+    }
+  ]
+}

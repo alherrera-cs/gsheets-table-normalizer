@@ -1,0 +1,50 @@
+{
+  "__schema__": [
+    "policy_number",
+    "insured_name",
+    "effective_date",
+    "expiration_date",
+    "premium",
+    "coverage_type",
+    "vehicle_vin",
+    "notes"
+  ],
+  "rows": [
+    {
+      "policy_number": "P001",
+      "insured_name": "John and Jane Doe",
+      "effective_date": "2025-01-01",
+      "expiration_date": "2026-01-01",
+      "premium": 1650.5,
+      "coverage_type": "Personal Auto",
+      "vehicle_vin": null,
+      "notes": null,
+      "_warnings": []
+    },
+    {
+      "policy_number": "P002",
+      "insured_name": "Alex Smith",
+      "effective_date": "2024-06-15",
+      "expiration_date": "2025-06-15",
+      "premium": 3200.0,
+      "coverage_type": "High-Risk Auto",
+      "vehicle_vin": null,
+      "notes": "Cancelled: Non-payment",
+      "_warnings": []
+    },
+    {
+      "policy_number": "P_BAD1",
+      "insured_name": "Test Insured",
+      "effective_date": "2025-12-01",
+      "expiration_date": "2025-01-01",
+      "premium": -100.0,
+      "coverage_type": "Something",
+      "vehicle_vin": null,
+      "notes": null,
+      "_warnings": [
+        "invalid_date_range",
+        "negative_premium"
+      ]
+    }
+  ]
+}

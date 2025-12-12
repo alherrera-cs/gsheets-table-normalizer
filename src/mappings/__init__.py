@@ -86,10 +86,15 @@ def get_mapping_by_id(mapping_id: str):
     
     Args:
         mapping_id: The unique ID of the mapping configuration
-        
+    
     Returns:
         Mapping configuration dictionary or None if not found
     """
+    import logging
+    logger = logging.getLogger(__name__)
+    
+    logger.debug(f"[get_mapping_by_id] Requested mapping ID: {mapping_id}")
+    
     all_mappings = (
         VEHICLES_MAPPINGS +
         DRIVERS_MAPPINGS +
@@ -99,10 +104,19 @@ def get_mapping_by_id(mapping_id: str):
         RELATIONSHIPS_MAPPINGS
     )
     
+    # Debug: List all available mapping IDs
+    available_ids = [m.get("id") for m in all_mappings]
+    logger.debug(f"[get_mapping_by_id] Available mapping IDs: {available_ids}")
+    
     for mapping in all_mappings:
         if mapping.get("id") == mapping_id:
+            found_id = mapping.get("id")
+            found_source_type = mapping.get("metadata", {}).get("source_type", "unknown")
+            found_mappings_count = len(mapping.get("mappings", []))
+            logger.debug(f"[get_mapping_by_id] Found mapping: ID={found_id}, source_type={found_source_type}, mappings_count={found_mappings_count}")
             return mapping
     
+    logger.warning(f"[get_mapping_by_id] Mapping ID '{mapping_id}' not found")
     return None
 
 

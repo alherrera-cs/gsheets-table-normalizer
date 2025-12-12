@@ -1,0 +1,36 @@
+{
+  "__schema__": [
+    "claim_number",
+    "policy_number",
+    "loss_date",
+    "claim_type",
+    "amount",
+    "description",
+    "status",
+    "notes"
+  ],
+  "rows": [
+    {
+      "claim_number": "CLM001",
+      "policy_number": "P001",
+      "loss_date": "2025-02-10",
+      "claim_type": "rear-end collision",
+      "amount": 8800.0,
+      "description": "Insured rear-ended another vehicle at a stop light.",
+      "status": "open",
+      "notes": null,
+      "_warnings": []
+    },
+    {
+      "claim_number": "CLM002",
+      "policy_number": "P002",
+      "loss_date": "2024-08-01",
+      "claim_type": "single vehicle rollover",
+      "amount": 22000.0,
+      "description": "Insured lost control on wet road; vehicle rolled once.",
+      "status": "closed",
+      "notes": null,
+      "_warnings": []
+    }
+  ]
+}

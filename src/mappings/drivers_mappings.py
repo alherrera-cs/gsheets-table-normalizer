@@ -57,15 +57,15 @@ DRIVERS_MAPPINGS = [
                 }
                 # "transform": "capitalize"  # Transform logic will be implemented later
             },
-            # DOB - multiple variants (CSV: "Date of Birth", Airtable: "DOB")
+            # Date of Birth - multiple variants (CSV: "Date of Birth", Airtable: "DOB")
             {
-                "target_field": "dob",
+                "target_field": "date_of_birth",
                 "source_field": "Date of Birth",
                 "type": "date",
                 "required": False
             },
             {
-                "target_field": "dob",
+                "target_field": "date_of_birth",
                 "source_field": "DOB",
                 "type": "date",
                 "required": False
@@ -125,7 +125,7 @@ DRIVERS_MAPPINGS = [
                 # "transform": "lowercase"  # Transform logic will be implemented later
             },
             {
-                "target_field": "years_licensed",
+                "target_field": "years_experience",
                 "source_field": "Years Licensed",
                 "type": "integer",
                 "required": False,
@@ -276,7 +276,7 @@ DRIVERS_MAPPINGS = [
                 # "transform": "capitalize"  # Transform logic will be implemented later
             },
             {
-                "target_field": "dob",
+                "target_field": "date_of_birth",
                 "source_field": "DOB",
                 "type": "date",
                 "required": False
@@ -322,7 +322,7 @@ DRIVERS_MAPPINGS = [
                 # "transform": "lowercase"  # Transform logic will be implemented later
             },
             {
-                "target_field": "years_licensed",
+                "target_field": "years_experience",
                 "source_field": "Years Licensed",
                 "type": "integer",
                 "required": False,
@@ -436,7 +436,7 @@ DRIVERS_MAPPINGS = [
                 "required": True
             },
             {
-                "target_field": "dob",
+                "target_field": "date_of_birth",
                 "source_field": "DATE_OF_BIRTH",
                 "type": "date",
                 "required": False
@@ -472,7 +472,7 @@ DRIVERS_MAPPINGS = [
                 "required": False
             },
             {
-                "target_field": "years_licensed",
+                "target_field": "years_experience",
                 "source_field": "YEARS_LICENSED",
                 "type": "integer",
                 "required": False
@@ -576,7 +576,7 @@ DRIVERS_MAPPINGS = [
                 "ai_instruction": "Extract the driver's last name from the document. Look for labels like 'Last Name', 'Surname', 'Family Name', 'LName', or names following the first name."
             },
             {
-                "target_field": "dob",
+                "target_field": "date_of_birth",
                 "source_field": "",
                 "type": "date",
                 "required": False,
@@ -624,7 +624,7 @@ DRIVERS_MAPPINGS = [
                 "ai_instruction": "Extract the driver's license status from the document. Look for labels like 'License Status', 'Status', 'DL Status', or status indicators. Common values include Valid, Suspended, Revoked, or Expired."
             },
             {
-                "target_field": "years_licensed",
+                "target_field": "years_experience",
                 "source_field": "",
                 "type": "integer",
                 "required": False,
@@ -741,7 +741,7 @@ DRIVERS_MAPPINGS = [
                 "ai_instruction": "Identify the driver's last name from the text. Look for names following keywords like 'Last Name:', 'Surname:', or names following the first name in driver descriptions."
             },
             {
-                "target_field": "dob",
+                "target_field": "date_of_birth",
                 "source_field": "",
                 "type": "date",
                 "required": False,
@@ -785,6 +785,13 @@ DRIVERS_MAPPINGS = [
                 "type": "string",
                 "required": False,
                 "ai_instruction": "Extract the driver's occupation from the text. Look for job titles or professions mentioned with keywords like 'Occupation:', 'Job:', 'Employment:', 'Profession:', or occupation descriptions in driver information."
+            },
+            {
+                "target_field": "notes",
+                "source_field": "",
+                "type": "string",
+                "required": False,
+                "ai_instruction": "Extract any additional notes or descriptive information about the driver from the text. This may include occupation, status descriptions, or other relevant details."
             }
         ]
     },
@@ -823,7 +830,7 @@ DRIVERS_MAPPINGS = [
                 "ai_instruction": "Extract the driver's last name from the image. Look for: 1) Surnames on driver's license documents. 2) Last names on registration or policy forms. 3) Names following first names in driver information sections."
             },
             {
-                "target_field": "dob",
+                "target_field": "date_of_birth",
                 "source_field": "",
                 "type": "date",
                 "required": False,

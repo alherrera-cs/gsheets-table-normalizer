@@ -1,0 +1,47 @@
+{
+  "__schema__": [
+    "claim_number",
+    "policy_number",
+    "loss_date",
+    "claim_type",
+    "amount",
+    "description",
+    "status",
+    "notes"
+  ],
+  "rows": [
+    {
+      "claim_number": "C001",
+      "policy_number": "P001",
+      "loss_date": "2024-01-10",
+      "claim_type": "collision",
+      "amount": 4500.0,
+      "description": "Rear-end collision",
+      "status": "open",
+      "notes": null,
+      "_warnings": []
+    },
+    {
+      "claim_number": "C002",
+      "policy_number": "P002",
+      "loss_date": "2024-03-22",
+      "claim_type": "comprehensive",
+      "amount": 320.0,
+      "description": "Windshield damage",
+      "status": "closed",
+      "notes": null,
+      "_warnings": []
+    },
+    {
+      "claim_number": "C003",
+      "policy_number": null,
+      "loss_date": "2024-02-15",
+      "claim_type": "theft",
+      "amount": 15000.0,
+      "description": "Vehicle theft",
+      "status": "denied",
+      "notes": "Unstructured claim text",
+      "_warnings": []
+    }
+  ]
+}

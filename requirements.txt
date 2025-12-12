@@ -1,0 +1,11 @@
+pandas
+openpyxl
+xlrd
+python-dateutil
+tabulate
+rich
+
+# OCR / unstructured extraction
+pytesseract
+pdf2image
+easyocr

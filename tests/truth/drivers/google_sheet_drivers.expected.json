@@ -1,0 +1,59 @@
+{
+  "__schema__": [
+    "driver_id",
+    "first_name",
+    "last_name",
+    "date_of_birth",
+    "license_number",
+    "license_state",
+    "license_status",
+    "years_experience",
+    "violations_count",
+    "training_completed",
+    "notes"
+  ],
+  "rows": [
+    {
+      "driver_id": "D001",
+      "first_name": "John",
+      "last_name": "Doe",
+      "date_of_birth": "1985-03-15",
+      "license_number": "D1234567",
+      "license_state": "CA",
+      "license_status": "Valid",
+      "years_experience": 18,
+      "violations_count": null,
+      "training_completed": null,
+      "notes": null,
+      "_warnings": []
+    },
+    {
+      "driver_id": "D002",
+      "first_name": "Jane",
+      "last_name": "Doe",
+      "date_of_birth": "1987-07-22",
+      "license_number": "D7654321",
+      "license_state": "CA",
+      "license_status": "Valid",
+      "years_experience": 16,
+      "violations_count": null,
+      "training_completed": null,
+      "notes": null,
+      "_warnings": []
+    },
+    {
+      "driver_id": "D_BAD1",
+      "first_name": "Alex",
+      "last_name": "Smith",
+      "date_of_birth": null,
+      "license_number": "INVALID-LIC",
+      "license_state": "XX",
+      "license_status": "Suspended",
+      "years_experience": -1,
+      "violations_count": null,
+      "training_completed": null,
+      "notes": null,
+      "_warnings": []
+    }
+  ]
+}

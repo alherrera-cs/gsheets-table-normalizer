@@ -1,0 +1,47 @@
+{
+  "__schema__": [
+    "policy_number",
+    "insured_name",
+    "effective_date",
+    "expiration_date",
+    "premium",
+    "coverage_type",
+    "vehicle_vin",
+    "notes"
+  ],
+  "rows": [
+    {
+      "policy_number": "P001",
+      "insured_name": "John and Jane Doe",
+      "effective_date": null,
+      "expiration_date": null,
+      "premium": null,
+      "coverage_type": "personal auto",
+      "vehicle_vin": null,
+      "notes": null,
+      "_warnings": []
+    },
+    {
+      "policy_number": "P002",
+      "insured_name": "Alex Smith",
+      "effective_date": null,
+      "expiration_date": null,
+      "premium": null,
+      "coverage_type": "high-risk auto",
+      "vehicle_vin": null,
+      "notes": null,
+      "_warnings": []
+    },
+    {
+      "policy_number": "P_BAD1",
+      "insured_name": null,
+      "effective_date": null,
+      "expiration_date": null,
+      "premium": null,
+      "coverage_type": null,
+      "vehicle_vin": null,
+      "notes": null,
+      "_warnings": []
+    }
+  ]
+}

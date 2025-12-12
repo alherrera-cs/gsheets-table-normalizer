@@ -29,13 +29,13 @@ LOCATIONS_MAPPINGS = [
                 }
             },
             {
-                "target_field": "named_insured",
+                "target_field": "insured_name",
                 "source_field": "Named Insured",
                 "type": "string",
                 "required": False
             },
             {
-                "target_field": "address1",
+                "target_field": "address_line_1",
                 "source_field": "Address Line 1",
                 "type": "string",
                 "required": False
@@ -58,7 +58,7 @@ LOCATIONS_MAPPINGS = [
                 # "transform": "uppercase"  # Transform logic will be implemented later
             },
             {
-                "target_field": "zip",
+                "target_field": "postal_code",
                 "source_field": "Postal Code",
                 "type": "string",
                 "required": False
@@ -104,6 +104,12 @@ LOCATIONS_MAPPINGS = [
                     "min": -180,
                     "max": 180
                 }
+            },
+            {
+                "target_field": "notes",
+                "source_field": "",
+                "type": "string",
+                "required": False
             }
         ]
     },
@@ -128,13 +134,13 @@ LOCATIONS_MAPPINGS = [
                 "required": True
             },
             {
-                "target_field": "named_insured",
+                "target_field": "insured_name",
                 "source_field": "Named Insured",
                 "type": "string",
                 "required": False
             },
             {
-                "target_field": "address1",
+                "target_field": "address_line_1",
                 "source_field": "Address Line 1",
                 "type": "string",
                 "required": False
@@ -152,7 +158,7 @@ LOCATIONS_MAPPINGS = [
                 "required": False
             },
             {
-                "target_field": "zip",
+                "target_field": "postal_code",
                 "source_field": "Postal Code",
                 "type": "string",
                 "required": False
@@ -210,13 +216,13 @@ LOCATIONS_MAPPINGS = [
                 "required": True
             },
             {
-                "target_field": "named_insured",
+                "target_field": "insured_name",
                 "source_field": "NAMED_INSURED",
                 "type": "string",
                 "required": False
             },
             {
-                "target_field": "address1",
+                "target_field": "address_line_1",
                 "source_field": "ADDRESS_LINE_1",
                 "type": "string",
                 "required": False
@@ -234,7 +240,7 @@ LOCATIONS_MAPPINGS = [
                 "required": False
             },
             {
-                "target_field": "zip",
+                "target_field": "postal_code",
                 "source_field": "POSTAL_CODE",
                 "type": "string",
                 "required": False
@@ -292,7 +298,7 @@ LOCATIONS_MAPPINGS = [
                 "ai_instruction": "Extract the location ID or location identifier from the document. Look for labels like 'Location ID', 'ID', 'Location Number', or unique identifiers associated with location information."
             },
             {
-                "target_field": "address1",
+                "target_field": "address_line_1",
                 "source_field": "",
                 "type": "string",
                 "required": False,
@@ -313,7 +319,7 @@ LOCATIONS_MAPPINGS = [
                 "ai_instruction": "Extract the state from the document. Look for labels like 'State', or state abbreviations (2 letters) in address sections."
             },
             {
-                "target_field": "zip",
+                "target_field": "postal_code",
                 "source_field": "",
                 "type": "string",
                 "required": False,
@@ -357,38 +363,75 @@ LOCATIONS_MAPPINGS = [
         "mappings": [
             {
                 "target_field": "location_id",
-                "source_field": "",
+                "source_field": "Location ID",
                 "type": "string",
-                "required": True,
-                "ai_instruction": "Search the text for a location ID or location identifier. It may be mentioned explicitly with keywords like 'Location ID:', 'ID:', 'Location Number:', or may appear as a unique identifier associated with location information."
+                "required": True
             },
             {
-                "target_field": "address1",
-                "source_field": "",
+                "target_field": "insured_name",
+                "source_field": "Named Insured",
                 "type": "string",
-                "required": False,
-                "ai_instruction": "Extract the street address from the text. Look for addresses mentioned with keywords like 'Address:', 'Street:', or street addresses in location descriptions."
+                "required": False
+            },
+            {
+                "target_field": "address_line_1",
+                "source_field": "Address Line 1",
+                "type": "string",
+                "required": False
             },
             {
                 "target_field": "city",
-                "source_field": "",
+                "source_field": "City",
                 "type": "string",
-                "required": False,
-                "ai_instruction": "Extract the city from the text. Look for city names mentioned with keywords like 'City:', or city names in address descriptions."
+                "required": False
             },
             {
                 "target_field": "state",
-                "source_field": "",
+                "source_field": "State",
                 "type": "string",
-                "required": False,
-                "ai_instruction": "Extract the state from the text. Look for state abbreviations (2 letters like 'CA', 'TX') or state names mentioned with keywords like 'State:', or in address descriptions."
+                "required": False
             },
             {
-                "target_field": "zip",
+                "target_field": "postal_code",
+                "source_field": "Postal Code",
+                "type": "string",
+                "required": False
+            },
+            {
+                "target_field": "county",
+                "source_field": "County",
+                "type": "string",
+                "required": False
+            },
+            {
+                "target_field": "territory_code",
+                "source_field": "Territory Code",
+                "type": "string",
+                "required": False
+            },
+            {
+                "target_field": "protection_class",
+                "source_field": "Protection Class",
+                "type": "integer",
+                "required": False
+            },
+            {
+                "target_field": "latitude",
+                "source_field": "Latitude",
+                "type": "decimal",
+                "required": False
+            },
+            {
+                "target_field": "longitude",
+                "source_field": "Longitude",
+                "type": "decimal",
+                "required": False
+            },
+            {
+                "target_field": "notes",
                 "source_field": "",
                 "type": "string",
-                "required": False,
-                "ai_instruction": "Extract the ZIP or postal code from the text. Look for postal codes mentioned with keywords like 'ZIP:', 'Postal Code:', or postal codes (5 or 9 digits) in address descriptions."
+                "required": False
             }
         ]
     },
@@ -413,7 +456,7 @@ LOCATIONS_MAPPINGS = [
                 "ai_instruction": "Analyze the image for a location ID or location identifier. The ID may appear: on location documents, on registration forms, on policy documents, or in any location information visible in the image. Use OCR to extract the identifier."
             },
             {
-                "target_field": "address1",
+                "target_field": "address_line_1",
                 "source_field": "",
                 "type": "string",
                 "required": False,
@@ -434,7 +477,7 @@ LOCATIONS_MAPPINGS = [
                 "ai_instruction": "Extract the state from the image. Look for: 1) State abbreviations or names on location documents. 2) State information in address sections. 3) State codes (2 letters) in location information visible in the image."
             },
             {
-                "target_field": "zip",
+                "target_field": "postal_code",
                 "source_field": "",
                 "type": "string",
                 "required": False,

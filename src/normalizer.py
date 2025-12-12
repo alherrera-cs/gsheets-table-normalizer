@@ -12,18 +12,265 @@ import re
 
 from sources import SourceType, detect_source_type, extract_from_source
 from transforms import apply_transform
-from schema import validate_schema, FieldType, ValidationError
+from schema import (
+    FieldType, ValidationError, 
+    reorder_all_policies, reorder_all_locations, reorder_all_drivers,
+    reorder_all_relationships, reorder_all_claims
+)
 from external_tables import (
     clean_header,
+    normalize_header,
     rows2d_to_objects,
     normalize_values,
     drop_empty_rows,
 )
+from inference import (
+    apply_fallback_inference,
+    is_headerless_file,
+    fuzzy_match_header,
+    levenshtein_distance,
+    detect_vin_in_row,
+    detect_year_in_row,
+    detect_make_model_in_row,
+)
+
+
+def clean_none(value: Any) -> Optional[str]:
+    """
+    Remove accidental "None" strings from values.
+    
+    Args:
+        value: Value to clean
+    
+    Returns:
+        None if value is empty/None or the literal string "None", otherwise the cleaned string
+    """
+    if not value:
+        return None
+    text = str(value).strip()
+    return None if text.lower() == "none" else text
 
 
 class NormalizationError(Exception):
     """Raised when normalization fails."""
     pass
+
+
+def _calculate_header_similarity(header1: str, header2: str) -> float:
+    """
+    Calculate similarity between two headers using Levenshtein distance.
+    
+    Args:
+        header1: First header (normalized)
+        header2: Second header (normalized)
+    
+    Returns:
+        Similarity score (0.0-1.0)
+    """
+    if not header1 or not header2:
+        return 0.0
+    
+    if header1 == header2:
+        return 1.0
+    
+    max_len = max(len(header1), len(header2))
+    if max_len == 0:
+        return 0.0
+    
+    distance = levenshtein_distance(header1, header2)
+    similarity = 1.0 - (distance / max_len)
+    
+    return similarity
+
+
+# ============================================================================
+# Internal Helper Functions for normalize_v2
+# ============================================================================
+
+def _apply_simple_transform(transform: str, value: Any) -> Any:
+    """
+    Apply simple transform directly to a value.
+    Handles: uppercase, lowercase, capitalize, standardize_fuel_type
+    """
+    transform_lower = transform.lower().strip()
+    
+    # Apply simple transform directly to the extracted value
+    if transform_lower == "uppercase":
+        return str(value).upper()
+    elif transform_lower == "lowercase":
+        return str(value).lower()
+    elif transform_lower == "capitalize":
+        s = str(value)
+        return s[0].upper() + s[1:].lower() if s else ""
+    elif transform_lower == "standardize_fuel_type":
+        # Standardize fuel type: "Gas" -> "gasoline", keep others as lowercase
+        value_str = str(value).strip()
+        value_lower = value_str.lower()
+        if value_lower in ["gas", "gasoline"]:
+            return "gasoline"
+        elif value_lower in ["diesel", "electric", "hybrid", "plug-in hybrid"]:
+            return value_lower
+        else:
+            return value_str  # Keep original if not recognized
+    
+    return value
+
+
+def _normalize_value(target_field: str, value: Any) -> Any:
+    """
+    Normalize common value variations (applied after transforms).
+    Handles: transmission, body_style
+    """
+    if value is not None and value != "":
+        value_str = str(value).strip()
+        # Normalize transmission values - handle variations like "8-speed automatic"
+        if target_field == "transmission":
+            value_lower = value_str.lower()
+            # Extract core transmission type from descriptions
+            if "automatic" in value_lower or "auto" in value_lower:
+                return "automatic"
+            elif "manual" in value_lower:
+                return "manual"
+            elif "cvt" in value_lower:
+                return "cvt"
+            else:
+                # Fallback to exact match
+                transmission_normalized = {
+                    "auto": "automatic",
+                    "automatic": "automatic",
+                    "manual": "manual",
+                    "cvt": "cvt",
+                    "AUTO": "automatic",
+                    "AUTOMATIC": "automatic",
+                    "MANUAL": "manual",
+                    "CVT": "cvt"
+                }
+                if value_str in transmission_normalized:
+                    return transmission_normalized[value_str]
+        
+        # Normalize body_style to lowercase (if not already transformed)
+        if target_field == "body_style" and value_str != value_str.lower():
+            return value_str.lower()
+    
+    return value
+
+
+def _prepare_rows(raw_data: List[List[Any]], header_row_index: int, file_is_headerless: bool) -> List[Dict[str, Any]]:
+    """
+    Prepare rows from raw 2D data, handling both headerless and normal files.
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+    
+    if file_is_headerless:
+        logger.debug(f"[normalize_v2] Detected headerless file - will use fallback inference mode")
+        # For headerless files, treat all rows starting from header_row_index as data
+        # Create row dicts with numeric keys for fallback inference
+        rows = []
+        # Skip the header row - start from header_row_index + 1
+        data_rows = raw_data[header_row_index + 1:] if len(raw_data) > header_row_index else []
+        for row_data in data_rows:
+            row_dict = {}
+            for col_idx, value in enumerate(row_data):
+                row_dict[str(col_idx)] = value
+            rows.append(row_dict)
+        return rows
+    else:
+        # Convert 2D data to objects
+        # rows2d_to_objects() now uses normalize_header() internally, so all headers
+        # are already normalized when the row dictionaries are created
+        return rows2d_to_objects(raw_data, header_row_index=header_row_index)
+
+
+def _generate_warnings(row_result: Dict[str, Any]) -> List[str]:
+    """
+    Generate data quality warnings for a row.
+    Returns list of warning strings in the same order as inline code.
+    """
+    warnings = []
+    
+    # Vehicle-specific warnings
+    # Year warning: if year is not None and (year < 1990 or year > 2035)
+    # Only check if this is a vehicle record (has vin or vehicle_id field)
+    if "vin" in row_result or "vehicle_id" in row_result:
+        year = row_result.get("year")
+        if year is not None and (year < 1990 or year > 2035):
+            warnings.append("invalid_year")
+    
+    # Driver-specific warnings
+    # Date of birth warning: if date_of_birth is not None, extract year and check
+    date_of_birth = row_result.get("date_of_birth")
+    if date_of_birth is not None and isinstance(date_of_birth, str):
+        try:
+            # Extract year from YYYY-MM-DD format
+            if len(date_of_birth) >= 4:
+                birth_year = int(date_of_birth[:4])
+                if birth_year < 1900 or birth_year > 2010:  # Reasonable DOB range
+                    warnings.append("invalid_date_of_birth")
+        except (ValueError, TypeError):
+            pass
+    
+    # Negative mileage warning: if mileage is not None and mileage < 0
+    mileage = row_result.get("mileage")
+    if mileage is not None and mileage < 0:
+        warnings.append("negative_mileage")
+    
+    # Invalid email warning: basic check using pattern: value contains "@" and "." and no spaces
+    owner_email = row_result.get("owner_email")
+    if owner_email is not None and owner_email != "":
+        email_str = str(owner_email)
+        if "@" not in email_str or "." not in email_str or " " in email_str:
+            warnings.append("invalid_email")
+    
+    # Transmission warning: allowed values are automatic, manual, cvt (case-insensitive)
+    transmission = row_result.get("transmission")
+    if transmission is not None and transmission != "":
+        transmission_lower = str(transmission).lower()
+        allowed_transmissions = ["automatic", "manual", "cvt"]
+        if transmission_lower not in allowed_transmissions:
+            warnings.append("unknown_transmission")
+    
+    # Fuel type warning: allowed values are gas, gasoline, diesel, electric, hybrid (case-insensitive)
+    fuel_type = row_result.get("fuel_type")
+    if fuel_type is not None and fuel_type != "":
+        fuel_type_lower = str(fuel_type).lower()
+        allowed_fuel_types = ["gas", "gasoline", "diesel", "electric", "hybrid"]
+        if fuel_type_lower not in allowed_fuel_types:
+            warnings.append("unknown_fuel_type")
+    
+    # Body style warning: allowed values are sedan, suv, truck, crossover, coupe, boat (case-insensitive)
+    body_style = row_result.get("body_style")
+    if body_style is not None and body_style != "":
+        body_style_lower = str(body_style).lower()
+        allowed_body_styles = ["sedan", "suv", "truck", "crossover", "coupe", "boat"]
+        if body_style_lower not in allowed_body_styles:
+            warnings.append("unknown_body_style")
+    
+    # Policy-specific warnings
+    # Invalid date range: expiration_date < effective_date
+    effective_date = row_result.get("effective_date")
+    expiration_date = row_result.get("expiration_date")
+    if effective_date is not None and expiration_date is not None:
+        try:
+            # Dates should be in YYYY-MM-DD format
+            if isinstance(effective_date, str) and isinstance(expiration_date, str):
+                if len(effective_date) == 10 and len(expiration_date) == 10:
+                    if expiration_date < effective_date:
+                        warnings.append("invalid_date_range")
+        except (ValueError, TypeError):
+            pass  # Skip if dates can't be compared
+    
+    # Negative premium warning: if premium is not None and premium < 0
+    premium = row_result.get("premium")
+    if premium is not None:
+        try:
+            premium_float = float(premium) if not isinstance(premium, (int, float)) else premium
+            if premium_float < 0:
+                warnings.append("negative_premium")
+        except (ValueError, TypeError):
+            pass  # Skip if premium can't be converted to float
+    
+    return warnings
 
 
 def normalize_v2(
@@ -70,6 +317,16 @@ def normalize_v2(
         mapping_id = mapping_config.get("id", "unknown")
         mappings = mapping_config.get("mappings", [])
         
+        # Debug: Log mapping details
+        import logging
+        logger = logging.getLogger(__name__)
+        target_fields = [m.get("target_field") for m in mappings if m.get("target_field")]
+        unique_target_fields = sorted(set(target_fields))
+        logger.debug(f"[normalize_v2] Mapping ID: {mapping_id}")
+        logger.debug(f"[normalize_v2] Source type from mapping: {source_type_str}")
+        logger.debug(f"[normalize_v2] Number of field mappings: {len(mappings)}")
+        logger.debug(f"[normalize_v2] Target fields: {unique_target_fields}")
+        
         # Detect source type - handle mapping structure source_type values
         try:
             # Map mapping structure source_type to SourceType enum
@@ -94,26 +351,57 @@ def normalize_v2(
             })
             return result
         
+        # Override extraction method if file_path is provided and file type differs from mapping
+        # The mapping's source_type is still used for mapping logic, but extraction uses actual file type
+        extraction_source_type = source_type  # Default to mapping's source_type
+        if isinstance(source, dict) and "file_path" in source:
+            file_path = Path(source["file_path"])
+            if file_path.exists():
+                file_ext = file_path.suffix.lower()
+                if file_ext == ".csv":
+                    extraction_source_type = SourceType.CSV
+                    logger.debug("normalize_v2: overriding source_type to CSV because file_path points to a CSV file")
+                elif file_ext == ".pdf":
+                    extraction_source_type = SourceType.PDF
+                    logger.debug("normalize_v2: overriding source_type to PDF because file_path points to a PDF file")
+                elif file_ext in [".png", ".jpg", ".jpeg"]:
+                    extraction_source_type = SourceType.IMAGE
+                    logger.debug("normalize_v2: overriding source_type to IMAGE because file_path points to an image file")
+                elif file_ext == ".json" and source_type_str == "image":
+                    # Image metadata JSON files should be handled as JSON (like Airtable)
+                    extraction_source_type = SourceType.AIRTABLE  # Use Airtable JSON handler
+                    logger.debug("normalize_v2: overriding source_type to AIRTABLE for image metadata JSON file")
+        
         # Prepare source for extraction
-        if source_type == SourceType.GOOGLE_SHEETS:
+        logger.debug(f"[normalize_v2] Preparing source for extraction. mapping source_type={source_type}, extraction_source_type={extraction_source_type}, source={source}")
+        
+        if extraction_source_type == SourceType.GOOGLE_SHEETS:
             source_dict = {
                 "sheet_id": connection_config.get("spreadsheet_id") or str(source),
                 "range": connection_config.get("data_range", "Sheet1!A:Z"),
             }
-        elif source_type == SourceType.CSV:
+            logger.debug(f"[normalize_v2] Using Google Sheets extraction. source_dict={source_dict}")
+        elif extraction_source_type == SourceType.CSV:
             # CSV files can be specified in connection_config or source
             file_path = connection_config.get("file_path") or (source if isinstance(source, (str, Path)) else source.get("file_path"))
             source_dict = {"file_path": str(file_path)}
+            logger.debug(f"[normalize_v2] Using CSV extraction. file_path={file_path}")
         else:
             source_dict = source
+            logger.debug(f"[normalize_v2] Using source as-is. source_dict={source_dict}")
         
         # Extract raw data
         try:
+            logger.info(f"[DEBUG normalize_v2] Calling extract_from_source with extraction_source_type={extraction_source_type}, mapping_id={mapping_id}")
+            logger.debug(f"[normalize_v2] Calling extract_from_source with extraction_source_type={extraction_source_type}")
             raw_data = extract_from_source(
                 source_dict,
-                source_type=source_type,
+                source_type=extraction_source_type,
                 header_row_index=header_row_index,
+                mapping_id=mapping_id,
             )
+            logger.info(f"[DEBUG normalize_v2] extract_from_source returned {len(raw_data) if raw_data else 0} rows")
+            logger.debug(f"[normalize_v2] Extracted {len(raw_data) if raw_data else 0} rows of raw data")
         except NotImplementedError as e:
             result["errors"].append({
                 "target_field": "_system",
@@ -135,8 +423,10 @@ def normalize_v2(
             result["success"] = True  # No data is not an error
             return result
         
-        # Convert 2D data to objects
-        rows = rows2d_to_objects(raw_data, header_row_index=header_row_index)
+        # Detect if file is headerless (first row looks like data, not headers)
+        file_is_headerless = is_headerless_file(raw_data, header_row_index)
+        rows = _prepare_rows(raw_data, header_row_index, file_is_headerless)
+        
         result["total_rows"] = len(rows)
         
         # Process each row
@@ -173,20 +463,69 @@ def normalize_v2(
                     # (Don't skip - we want to try all variants for required fields)
                 
                 # Determine extraction method
+                value = None
                 if source_field:
                     # Structured source - direct column lookup
-                    # Clean the source field name to match cleaned headers
-                    cleaned_source_field = clean_header(source_field)
-                    value = row.get(cleaned_source_field)
+                    # Normalize the source field name to match normalized row keys
+                    normalized_source_field = normalize_header(source_field)
+                    value = row.get(normalized_source_field)
+                    
+                    # If exact match failed, try fuzzy matching (only for headerless files or if value is None)
+                    if value is None and (file_is_headerless or not file_is_headerless):
+                        # Try fuzzy match against all row keys
+                        for row_key in row.keys():
+                            if fuzzy_match_header(row_key, normalized_source_field, threshold=0.75):
+                                value = row.get(row_key)
+                                logger.debug(f"[Fuzzy Match] Matched '{source_field}' (normalized: '{normalized_source_field}') to row key '{row_key}'")
+                                break
                 elif ai_instruction:
-                    # AI-powered source - TODO: implement AI extraction
+                    # AI-powered source - try to extract from OCR-extracted row data
+                    # For OCR sources, the row dict contains extracted columns
+                    # Try fuzzy matching target_field name against row keys first
                     value = None
-                    row_errors.append({
-                        "target_field": target_field,
-                        "_source_id": mapping_id,
-                        "_source_row_number": row_idx,
-                        "error": "AI/OCR extraction not yet implemented"
-                    })
+                    
+                    # First, try exact match on normalized target_field name
+                    normalized_target = normalize_header(target_field)
+                    value = row.get(normalized_target)
+                    
+                    # If not found, try fuzzy matching against all row keys
+                    if value is None or value == "":
+                        best_match = None
+                        best_similarity = 0.0
+                        for row_key in row.keys():
+                            # Try matching target_field name to row key using fuzzy matching
+                            if fuzzy_match_header(row_key, normalized_target, threshold=0.6):
+                                similarity = _calculate_header_similarity(normalized_target, row_key.lower())
+                                if similarity > best_similarity:
+                                    best_similarity = similarity
+                                    best_match = row_key
+                        
+                        if best_match:
+                            value = row.get(best_match)
+                    
+                    # For specific fields, use fallback inference functions that search all values
+                    # This handles cases where OCR extracted concatenated text
+                    if value is None or value == "":
+                        if target_field == "vin":
+                            vin_result = detect_vin_in_row(row)
+                            if vin_result:
+                                value, _ = vin_result
+                        elif target_field == "year":
+                            year_result = detect_year_in_row(row)
+                            if year_result:
+                                value, _ = year_result
+                        elif target_field == "make":
+                            make_model_result = detect_make_model_in_row(row)
+                            if make_model_result:
+                                value, _, _ = make_model_result
+                        elif target_field == "model":
+                            make_model_result = detect_make_model_in_row(row)
+                            if make_model_result:
+                                make_val, model_val, _ = make_model_result
+                                if model_val:
+                                    value = model_val
+                    
+                    # If still not found, value remains None (fallback inference will try later)
                 else:
                     # No source field or AI instruction
                     value = None
@@ -200,31 +539,81 @@ def normalize_v2(
                     pass
                 
                 # Apply transforms - runs AFTER raw value extraction, BEFORE type conversion
-                # Transform receives the entire raw row dict as context
+                # For simple transforms without arguments (e.g., "uppercase", "lowercase"), apply directly to value
+                # For complex transforms with arguments, use the row as context
+                # Special case: transforms that don't need a source value (like combine_image_metadata_notes)
+                # should be called even if value is None/empty
                 if transform:
-                    try:
-                        transform_result = apply_transform(row, transform)
-                        if transform_result.error:
-                            # Transform failed - append error but continue with original value
+                    # Check if this is a transform that works on the entire row (no source value needed)
+                    row_based_transforms = ["combine_image_metadata_notes"]
+                    if transform.lower() in row_based_transforms:
+                        # Call transform with row context, ignore extracted value
+                        try:
+                            if '(' not in transform and '[' not in transform:
+                                transform_result = apply_transform(row, f"{transform}()")
+                            else:
+                                transform_result = apply_transform(row, transform)
+                            
+                            if transform_result.error:
+                                row_errors.append({
+                                    "target_field": target_field,
+                                    "_source_id": mapping_id,
+                                    "_source_row_number": row_idx,
+                                    "error": f"Transform error: {transform_result.error}"
+                                })
+                            else:
+                                value = transform_result.value
+                        except Exception as e:
                             row_errors.append({
                                 "target_field": target_field,
                                 "_source_id": mapping_id,
                                 "_source_row_number": row_idx,
-                                "error": f"Transform error: {transform_result.error}"
+                                "error": f"Transform exception: {str(e)}"
+                            })
+                    elif value is not None and value != "":
+                        try:
+                            # Check if it's a simple transform that should be applied to the value directly
+                            simple_transforms = ["uppercase", "lowercase", "capitalize", "standardize_fuel_type"]
+                            transform_lower = transform.lower().strip()
+                            
+                            if transform_lower in simple_transforms and '(' not in transform:
+                                # Apply simple transform directly to the extracted value
+                                value = _apply_simple_transform(transform, value)
+                            else:
+                                # Complex transform - use row as context and pass normalized field name
+                                # If transform doesn't have arguments, add the normalized field name
+                                if '(' not in transform and '[' not in transform:
+                                    # Simple transform name without args - construct with normalized field
+                                    transform_with_field = f"{transform}({normalized_source_field})"
+                                    transform_result = apply_transform(row, transform_with_field)
+                                else:
+                                    # Transform already has arguments
+                                    transform_result = apply_transform(row, transform)
+                                
+                                if transform_result.error:
+                                    # Transform failed - append error but continue with original value
+                                    row_errors.append({
+                                        "target_field": target_field,
+                                        "_source_id": mapping_id,
+                                        "_source_row_number": row_idx,
+                                        "error": f"Transform error: {transform_result.error}"
+                                    })
+                                    # Continue using original extracted value
+                                else:
+                                    # Transform succeeded - use transformed value
+                                    value = transform_result.value
+                        except Exception as e:
+                            # Unexpected error during transform - append error but continue with original value
+                            row_errors.append({
+                                "target_field": target_field,
+                                "_source_id": mapping_id,
+                                "_source_row_number": row_idx,
+                                "error": f"Transform exception: {str(e)}"
                             })
                             # Continue using original extracted value
-                        else:
-                            # Transform succeeded - use transformed value
-                            value = transform_result.value
-                    except Exception as e:
-                        # Unexpected error during transform - append error but continue with original value
-                        row_errors.append({
-                            "target_field": target_field,
-                            "_source_id": mapping_id,
-                            "_source_row_number": row_idx,
-                            "error": f"Transform exception: {str(e)}"
-                        })
-                        # Continue using original extracted value
+                
+                # Normalize common value variations (applied after transforms)
+                value = _normalize_value(target_field, value)
                 
                 if format_spec:
                     # TODO: Implement format specification logic
@@ -239,8 +628,30 @@ def normalize_v2(
                         elif field_type == "decimal":
                             value = float(str(value))
                         elif field_type == "date":
-                            # Keep as string for now, date parsing can be added later
-                            value = str(value).strip()
+                            # Normalize date to YYYY-MM-DD format
+                            value_str = str(value).strip()
+                            # Try to parse common date formats
+                            from datetime import datetime
+                            date_formats = [
+                                "%Y-%m-%d",
+                                "%m/%d/%Y",
+                                "%m-%d-%Y",
+                                "%Y/%m/%d",
+                                "%d/%m/%Y",
+                                "%d-%m-%Y",
+                            ]
+                            parsed = None
+                            for fmt in date_formats:
+                                try:
+                                    parsed = datetime.strptime(value_str, fmt)
+                                    break
+                                except ValueError:
+                                    continue
+                            if parsed:
+                                value = parsed.strftime("%Y-%m-%d")
+                            else:
+                                # If parsing fails, keep original but strip whitespace
+                                value = value_str
                     except (ValueError, TypeError):
                         row_errors.append({
                             "target_field": target_field,
@@ -330,6 +741,19 @@ def normalize_v2(
                     pass
                 # If both are None/empty, keep the existing None
             
+            # Apply fallback inference for fields that mapping missed
+            # Only infer fields that are currently None - mapping takes priority
+            # Get raw row values for inference (row_idx is 1-indexed)
+            if file_is_headerless:
+                # For headerless files, we skipped the header row, so data starts at header_row_index + 1
+                # row_idx is 1-indexed, so raw_row_idx = header_row_index + row_idx
+                raw_row_idx = header_row_index + row_idx
+            else:
+                # For normal files, skip header row
+                raw_row_idx = header_row_index + row_idx
+            raw_row_values = raw_data[raw_row_idx] if raw_row_idx < len(raw_data) else None
+            row_result = apply_fallback_inference(row, row_result, raw_row_values)
+            
             # Check required fields after all variants have been tried
             # Only check the first/primary required mapping for each target_field (avoid duplicates)
             checked_required_fields = set()
@@ -348,13 +772,285 @@ def normalize_v2(
                             "error": f"{target_field} is required"
                         })
             
+            # Normalize empty strings to None for consistency with truth files
+            for key, val in row_result.items():
+                if val == "":
+                    row_result[key] = None
+            
+            # Clean "None" strings from all fields (after transforms are applied)
+            for k, v in row_result.items():
+                if isinstance(v, str) and v.strip().lower() == "none":
+                    row_result[k] = None
+            
+            # Policy-specific normalization
+            # Strip all string fields
+            for key, val in row_result.items():
+                if isinstance(val, str):
+                    row_result[key] = val.strip()
+            
+            # Normalize premium to float if it's a string
+            if "premium" in row_result and row_result["premium"] is not None:
+                try:
+                    if isinstance(row_result["premium"], str):
+                        row_result["premium"] = float(row_result["premium"])
+                    elif not isinstance(row_result["premium"], (int, float)):
+                        row_result["premium"] = float(row_result["premium"])
+                except (ValueError, TypeError):
+                    pass  # Keep original value if conversion fails
+            
+            # Normalize vehicle_vin to uppercase
+            if "vehicle_vin" in row_result and row_result["vehicle_vin"] is not None:
+                if isinstance(row_result["vehicle_vin"], str):
+                    row_result["vehicle_vin"] = row_result["vehicle_vin"].strip().upper()
+            
+            # Location-specific normalization
+            # Strip all string fields
+            if "location_id" in row_result:
+                for key, val in row_result.items():
+                    if isinstance(val, str):
+                        row_result[key] = val.strip()
+                
+                # Normalize protection_class to integer if it's a string
+                if "protection_class" in row_result and row_result["protection_class"] is not None:
+                    try:
+                        if isinstance(row_result["protection_class"], str):
+                            row_result["protection_class"] = int(row_result["protection_class"])
+                        elif not isinstance(row_result["protection_class"], int):
+                            row_result["protection_class"] = int(row_result["protection_class"])
+                    except (ValueError, TypeError):
+                        pass  # Keep original value if conversion fails
+                
+                # Normalize latitude and longitude to float if they're strings
+                for coord_field in ["latitude", "longitude"]:
+                    if coord_field in row_result and row_result[coord_field] is not None:
+                        try:
+                            if isinstance(row_result[coord_field], str):
+                                row_result[coord_field] = float(row_result[coord_field])
+                            elif not isinstance(row_result[coord_field], (int, float)):
+                                row_result[coord_field] = float(row_result[coord_field])
+                        except (ValueError, TypeError):
+                            pass  # Keep original value if conversion fails
+            
+            # --- Build derived notes for cancelled policies ---
+            # Check if this is a policy record (has policy_number field)
+            if "policy_number" in row_result:
+                # Get Status from raw row data (try multiple variations)
+                status = (row.get("Status") or row.get("status") or 
+                         row.get("status") or row.get("STATUS"))
+                
+                # Get Cancel Reason from raw row data (try multiple variations)
+                cancel_reason = (row.get("Cancel Reason") or row.get("cancel_reason") or
+                               row.get("Cancellation Reason") or row.get("cancellation_reason") or
+                               row.get("CancelReason") or row.get("CancellationReason"))
+                
+                # Try fuzzy matching if direct lookup failed
+                if status is None:
+                    for row_key in row.keys():
+                        normalized_key = normalize_header(row_key)
+                        if normalized_key == "status" or fuzzy_match_header(row_key, "Status", threshold=0.75):
+                            status = row.get(row_key)
+                            break
+                
+                if cancel_reason is None:
+                    # Try multiple variations with fuzzy matching
+                    cancel_reason_variants = ["Cancel Reason", "Cancellation Reason", "CancelReason", "CancellationReason"]
+                    for variant in cancel_reason_variants:
+                        for row_key in row.keys():
+                            normalized_key = normalize_header(row_key)
+                            if normalized_key in ["cancel reason", "cancellation reason", "cancelreason", "cancellationreason"]:
+                                cancel_reason = row.get(row_key)
+                                break
+                        if cancel_reason:
+                            break
+                        # Also try fuzzy matching
+                        for row_key in row.keys():
+                            if fuzzy_match_header(row_key, variant, threshold=0.75):
+                                cancel_reason = row.get(row_key)
+                                break
+                        if cancel_reason:
+                            break
+                
+                # Build notes if policy is cancelled
+                if status and str(status).lower().strip() == "cancelled":
+                    if cancel_reason and str(cancel_reason).strip():
+                        row_result["notes"] = f"Cancelled: {str(cancel_reason).strip()}"
+                    else:
+                        row_result["notes"] = "Cancelled"
+                # If not cancelled and notes is empty/None, keep it as None
+                elif row_result.get("notes") is None or row_result.get("notes") == "":
+                    row_result["notes"] = None
+            
+            # Driver-specific normalization
+            # Strip all string fields and convert empty strings to None
+            if "driver_id" in row_result:
+                for key, val in row_result.items():
+                    if isinstance(val, str):
+                        val = val.strip()
+                        # Convert empty strings to None
+                        if val == "":
+                            row_result[key] = None
+                        else:
+                            row_result[key] = val
+                
+                # Normalize date_of_birth - parse common formats
+                if "date_of_birth" in row_result and row_result["date_of_birth"] is not None:
+                    dob = row_result["date_of_birth"]
+                    if isinstance(dob, str) and dob.strip():
+                        # Try to parse common date formats
+                        from datetime import datetime
+                        date_formats = [
+                            "%Y-%m-%d",
+                            "%m/%d/%Y",
+                            "%m-%d-%Y",
+                            "%Y/%m/%d",
+                            "%d/%m/%Y",
+                            "%d-%m-%Y",
+                        ]
+                        parsed = None
+                        for fmt in date_formats:
+                            try:
+                                parsed = datetime.strptime(dob.strip(), fmt)
+                                break
+                            except ValueError:
+                                continue
+                        if parsed:
+                            row_result["date_of_birth"] = parsed.strftime("%Y-%m-%d")
+                        # If parsing fails, keep original
+                
+                # Normalize years_experience to integer if it's a string
+                if "years_experience" in row_result and row_result["years_experience"] is not None:
+                    try:
+                        if isinstance(row_result["years_experience"], str):
+                            row_result["years_experience"] = int(row_result["years_experience"])
+                        elif not isinstance(row_result["years_experience"], int):
+                            row_result["years_experience"] = int(row_result["years_experience"])
+                    except (ValueError, TypeError):
+                        pass  # Keep original value if conversion fails
+                
+                # Normalize violations_count to integer if it's a string
+                if "violations_count" in row_result and row_result["violations_count"] is not None:
+                    try:
+                        if isinstance(row_result["violations_count"], str):
+                            row_result["violations_count"] = int(row_result["violations_count"])
+                        elif not isinstance(row_result["violations_count"], int):
+                            row_result["violations_count"] = int(row_result["violations_count"])
+                    except (ValueError, TypeError):
+                        pass  # Keep original value if conversion fails
+                
+                # Normalize training_completed - convert boolean-like strings
+                if "training_completed" in row_result and row_result["training_completed"] is not None:
+                    training = str(row_result["training_completed"]).strip().lower()
+                    if training in ["yes", "true", "1", "y"]:
+                        row_result["training_completed"] = "Yes"
+                    elif training in ["no", "false", "0", "n"]:
+                        row_result["training_completed"] = "No"
+                    # Otherwise keep as-is (could be a description)
+            
+            # Relationship-specific normalization
+            # Strip all string fields and convert empty strings to None
+            if "vehicle_vin" in row_result:
+                for key, val in row_result.items():
+                    if isinstance(val, str):
+                        val = val.strip()
+                        # Convert empty strings to None
+                        if val == "":
+                            row_result[key] = None
+                        else:
+                            row_result[key] = val
+                
+                # Normalize relationship_type - lowercase
+                if "relationship_type" in row_result and row_result["relationship_type"] is not None:
+                    rel_type = str(row_result["relationship_type"]).strip().lower()
+                    if rel_type:
+                        row_result["relationship_type"] = rel_type
+            
+            # Claim-specific normalization
+            # Strip all string fields and convert empty strings to None
+            if "claim_number" in row_result:
+                for key, val in row_result.items():
+                    if isinstance(val, str):
+                        val = val.strip()
+                        # Convert empty strings to None
+                        if val == "":
+                            row_result[key] = None
+                        else:
+                            row_result[key] = val
+                
+                # Normalize loss_date - parse common formats
+                if "loss_date" in row_result and row_result["loss_date"] is not None:
+                    loss_date = row_result["loss_date"]
+                    if isinstance(loss_date, str) and loss_date.strip():
+                        # Try to parse common date formats
+                        from datetime import datetime
+                        date_formats = [
+                            "%Y-%m-%d",
+                            "%m/%d/%Y",
+                            "%m-%d-%Y",
+                            "%Y/%m/%d",
+                            "%d/%m/%Y",
+                            "%d-%m-%Y",
+                        ]
+                        parsed = None
+                        for fmt in date_formats:
+                            try:
+                                parsed = datetime.strptime(loss_date.strip(), fmt)
+                                break
+                            except ValueError:
+                                continue
+                        if parsed:
+                            row_result["loss_date"] = parsed.strftime("%Y-%m-%d")
+                        # If parsing fails, keep original
+                
+                # Normalize amount to float if it's a string
+                if "amount" in row_result and row_result["amount"] is not None:
+                    try:
+                        if isinstance(row_result["amount"], str):
+                            # Remove commas and dollar signs
+                            amount_str = row_result["amount"].replace(",", "").replace("$", "").strip()
+                            row_result["amount"] = float(amount_str)
+                        elif not isinstance(row_result["amount"], (int, float)):
+                            row_result["amount"] = float(row_result["amount"])
+                    except (ValueError, TypeError):
+                        pass  # Keep original value if conversion fails
+                
+                # Normalize status and claim_type - lowercase
+                if "status" in row_result and row_result["status"] is not None:
+                    status = str(row_result["status"]).strip().lower()
+                    if status:
+                        row_result["status"] = status
+                
+                if "claim_type" in row_result and row_result["claim_type"] is not None:
+                    claim_type = str(row_result["claim_type"]).strip().lower()
+                    if claim_type:
+                        row_result["claim_type"] = claim_type
+            
+            # Add warnings for data quality issues
+            row_result["_warnings"] = _generate_warnings(row_result)
+            
             # Add row to results
+            # When validate=False, include all rows even if they have errors
             if row_errors:
                 result["errors"].extend(row_errors)
                 result["total_errors"] += 1
+                # Still add row to data when validate=False
+                if not validate:
+                    result["data"].append(row_result)
             else:
                 result["data"].append(row_result)
                 result["total_success"] += 1
+        
+        # Reorder rows by domain
+        mapping_id = mapping_config.get("id", "")
+        if "policies" in mapping_id.lower():
+            result["data"] = reorder_all_policies(result["data"])
+        elif "locations" in mapping_id.lower():
+            result["data"] = reorder_all_locations(result["data"])
+        elif "drivers" in mapping_id.lower():
+            result["data"] = reorder_all_drivers(result["data"])
+        elif "relationship" in mapping_id.lower() or "policy_vehicle_driver_link" in mapping_id.lower():
+            result["data"] = reorder_all_relationships(result["data"])
+        elif "claim" in mapping_id.lower():
+            result["data"] = reorder_all_claims(result["data"])
         
         result["success"] = result["total_errors"] == 0
         return result

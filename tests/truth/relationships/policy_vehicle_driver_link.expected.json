@@ -1,0 +1,35 @@
+{
+  "__schema__": [
+    "policy_number",
+    "vehicle_vin",
+    "driver_id",
+    "relationship_type",
+    "notes"
+  ],
+  "rows": [
+    {
+      "policy_number": "P001",
+      "vehicle_vin": "HBUSRJGF4CBFPR9BN",
+      "driver_id": "D001",
+      "relationship_type": "commute",
+      "notes": null,
+      "_warnings": []
+    },
+    {
+      "policy_number": "P001",
+      "vehicle_vin": "3R5UAL4YUKPYGF1GZ",
+      "driver_id": "D002",
+      "relationship_type": "pleasure",
+      "notes": null,
+      "_warnings": []
+    },
+    {
+      "policy_number": "P002",
+      "vehicle_vin": "ZTC6H1FV0NECRVFRG",
+      "driver_id": "D_BAD1",
+      "relationship_type": "business",
+      "notes": null,
+      "_warnings": []
+    }
+  ]
+}

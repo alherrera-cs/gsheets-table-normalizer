@@ -1,0 +1,47 @@
+{
+    "__schema__": [
+      "policy_number",
+      "insured_name",
+      "effective_date",
+      "expiration_date",
+      "premium",
+      "coverage_type",
+      "vehicle_vin",
+      "notes"
+    ],
+    "rows": [
+      {
+        "policy_number": "P001",
+        "insured_name": "John and Jane Doe",
+        "effective_date": "2025-01-01",
+        "expiration_date": "2026-01-01",
+        "premium": 1650.50,
+        "coverage_type": "Personal Auto",
+        "vehicle_vin": "HBUSRJGF4CBFPR9BN",
+        "notes": "Example OCR test.",
+        "_warnings": []
+      },
+      {
+        "policy_number": "P002",
+        "insured_name": "Alex Smith",
+        "effective_date": "2024-06-15",
+        "expiration_date": "2025-06-15",
+        "premium": 3200.00,
+        "coverage_type": "High-Risk Auto",
+        "vehicle_vin": "ZTC6H1FV0NECRVFRG",
+        "notes": "Cancelled mid-term.",
+        "_warnings": []
+      },
+      {
+        "policy_number": "P_BAD1",
+        "insured_name": null,
+        "effective_date": null,
+        "expiration_date": null,
+        "premium": -100.0,
+        "coverage_type": null,
+        "vehicle_vin": null,
+        "notes": "Random memo: AUTO POLICY P002 canceled. premium -100 dates reversed",
+        "_warnings": ["negative_premium", "invalid_date_range", "unstructured_policy"]
+      }
+    ]
+  }

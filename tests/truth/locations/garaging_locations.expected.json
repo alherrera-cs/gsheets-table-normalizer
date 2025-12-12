@@ -1,0 +1,48 @@
+{
+  "__schema__": [
+    "location_id",
+    "insured_name",
+    "address_line_1",
+    "city",
+    "state",
+    "postal_code",
+    "county",
+    "territory_code",
+    "protection_class",
+    "latitude",
+    "longitude",
+    "notes"
+  ],
+  "rows": [
+    {
+      "location_id": "L001",
+      "insured_name": "John and Jane Doe",
+      "address_line_1": "123 Main St",
+      "city": "Los Angeles",
+      "state": "CA",
+      "postal_code": "90001",
+      "county": "Los Angeles",
+      "territory_code": "CA01",
+      "protection_class": 3,
+      "latitude": 34.0522,
+      "longitude": -118.2437,
+      "notes": null,
+      "_warnings": []
+    },
+    {
+      "location_id": "L002",
+      "insured_name": "Alex Smith",
+      "address_line_1": "500 Elm St",
+      "city": "Dallas",
+      "state": "TX",
+      "postal_code": "75201",
+      "county": "Dallas",
+      "territory_code": "TX10",
+      "protection_class": 4,
+      "latitude": 32.7767,
+      "longitude": -96.797,
+      "notes": null,
+      "_warnings": []
+    }
+  ]
+}
