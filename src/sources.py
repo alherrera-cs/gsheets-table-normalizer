@@ -520,23 +520,23 @@ def _normalize_vision_value(field_name: str, value: Any, preserve_raw: bool = Tr
         # Return as string for other fields
         return value_str if value_str else None
     
-    # For non-PDF sources, apply normalization (original behavior)
-    # Type conversions for numeric fields
+    # For non-PDF sources, apply normalization but PRESERVE invalid values
+    # Type conversions for numeric fields - preserve invalid values, warnings will be generated later
     if field_name == "year":
         try:
             year = int(value_str)
-            if 1900 <= year <= 2035:
-                return year
-            return None
+            # Preserve invalid years - do not return None
+            return year
         except (ValueError, TypeError):
             return None
     
     if field_name == "mileage":
         try:
-            # Remove commas and other formatting
+            # Remove commas and other formatting, but preserve negative values
             mileage_str = value_str.replace(",", "").replace(" ", "")
             mileage = int(mileage_str)
-            return mileage if mileage >= 0 else None
+            # Preserve negative mileage - do not return None
+            return mileage
         except (ValueError, TypeError):
             return None
     
@@ -1090,16 +1090,17 @@ def extract_fields_from_block(text_block: str, mapping: Optional[Dict[str, Any]]
     from schema import VEHICLE_SCHEMA_ORDER
     import re
     
-    # Debug: Print block being processed
-    print(f"[extract_fields_from_block DEBUG] USING BLOCK: {text_block[:150]}")
+    # Debug: Log block being processed (suppressed in test output)
+    logger.debug(f"[extract_fields_from_block] USING BLOCK: {text_block[:150]}")
     
     # Initialize vehicle dict with all fields as None
     vehicle = {field: None for field in VEHICLE_SCHEMA_ORDER}
     
     # Extract VIN from this block (must be present)
-    # Exclude common words that might match
+    # Exclude common words that might match (including header tokens like "YEAR")
     excluded_words = {'DEALERSHIP', 'IDENTIFICATION', 'TRANSMISSION', 'DESCRIPTION', 
-                      'INFORMATION', 'REGISTRATION', 'DOCUMENTATION', 'SPECIFICATION'}
+                      'INFORMATION', 'REGISTRATION', 'DOCUMENTATION', 'SPECIFICATION',
+                      'YEAR', 'MAKE', 'MODEL', 'COLOR', 'MILEAGE', 'VIN'}
     
     # VIN pattern: handle multiple formats
     # Pattern 1: Full "Vehicle Identification Number (VIN): X" format (PDF format) - HIGH PRIORITY
@@ -1114,12 +1115,16 @@ def extract_fields_from_block(text_block: str, mapping: Optional[Dict[str, Any]]
     pdf_vin_extracted = False
     if pdf_match:
         vin = pdf_match.group(1).upper().strip()
-        if len(vin) >= 10 and len([c for c in vin if c.isdigit()]) >= 2 and vin not in excluded_words:
+        # Check excluded words FIRST before other validations
+        if vin in excluded_words:
+            logger.debug(f"[extract_fields_from_block] PDF VIN pattern matched excluded word: {vin}")
+            return None
+        if len(vin) >= 10 and len([c for c in vin if c.isdigit()]) >= 2:
             vehicle['vin'] = vin
             pdf_vin_extracted = True
-            print(f"[extract_fields_from_block DEBUG] PDF-style VIN extracted: {vin}")
+            logger.debug(f"[extract_fields_from_block] PDF-style VIN extracted: {vin}")
         else:
-            print(f"[extract_fields_from_block DEBUG] PDF pattern matched but VIN validation failed: {vin}")
+            logger.debug(f"[extract_fields_from_block] PDF pattern matched but VIN validation failed: {vin}")
             return None
     
     if not pdf_vin_extracted:
@@ -1127,46 +1132,62 @@ def extract_fields_from_block(text_block: str, mapping: Optional[Dict[str, Any]]
         vin_pattern = r'VIN[#\s:)]*\s+([A-Z0-9]{10,20})|([A-HJ-NPR-Z0-9]{17})\b|(?<![A-Z])([A-Z0-9]{10,16})(?![A-Z])'
         vin_match = re.search(vin_pattern, text_block, re.IGNORECASE)
         if not vin_match:
-            print(f"[extract_fields_from_block DEBUG] No VIN pattern matched in block (first 200 chars): {text_block[:200]}")
+            logger.debug(f"[extract_fields_from_block] No VIN pattern matched in block (first 200 chars): {text_block[:200]}")
             return None
         
         vin = (vin_match.group(1) or vin_match.group(2) or vin_match.group(3))
         if not vin:
-            print(f"[extract_fields_from_block DEBUG] VIN pattern matched but no capture group: {vin_match.groups()}")
+            logger.debug(f"[extract_fields_from_block] VIN pattern matched but no capture group: {vin_match.groups()}")
             return None
         vin = vin.upper().strip()
-        if len(vin) < 10:
-            print(f"[extract_fields_from_block DEBUG] VIN too short: {vin} (length: {len(vin)})")
+        
+        # CRITICAL: Check excluded words FIRST (before length/digit checks)
+        # This prevents header tokens like "YEAR", "MAKE", "MODEL" from being extracted as VINs
+        if vin in excluded_words:
+            logger.debug(f"[extract_fields_from_block] VIN is excluded word: {vin}")
             return None
         
-        # Filter out false positives
-        if vin in excluded_words:
-            print(f"[extract_fields_from_block DEBUG] VIN is excluded word: {vin}")
+        if len(vin) < 10:
+            logger.debug(f"[extract_fields_from_block] VIN too short: {vin} (length: {len(vin)})")
             return None
         
         # VINs should have at least one digit
         if not re.search(r'\d', vin):
-            print(f"[extract_fields_from_block DEBUG] VIN has no digits: {vin}")
+            logger.debug(f"[extract_fields_from_block] VIN has no digits: {vin}")
             return None
         
         # VINs should have at least 2 digits (to avoid false positives like "IDENTIFICATION")
         if len([c for c in vin if c.isdigit()]) < 2:
-            print(f"[extract_fields_from_block DEBUG] VIN has less than 2 digits: {vin}")
+            logger.debug(f"[extract_fields_from_block] VIN has less than 2 digits: {vin}")
             return None
         
         vehicle['vin'] = vin
     
     # Debug print for successful VIN extraction (only for non-PDF patterns, since PDF pattern already printed)
     if 'vin' in vehicle and vehicle['vin'] and not pdf_vin_extracted:
-        print(f"[extract_fields_from_block DEBUG] Successfully extracted VIN: {vehicle['vin']}")
+        logger.debug(f"[extract_fields_from_block] Successfully extracted VIN: {vehicle['vin']}")
     
     # Extract year: 4-digit year pattern
-    year_match = re.search(r'\b(19\d{2}|20[0-3]\d)\b', text_block)
+    # PRESERVE invalid years (e.g., 1899) - warnings will be generated later
+    # Match any 4-digit year starting with 18, 19, 20, or 21
+    year_match = re.search(r'\b(1[89]\d{2}|20[0-3]\d|21[0-3]\d)\b', text_block)
     if year_match:
         try:
-            vehicle['year'] = int(year_match.group(1))
+            vehicle['year'] = int(year_match.group(1))  # Preserve even if < 1990
         except ValueError:
             pass
+    else:
+        # Fallback: try to find any 4-digit number that might be a year
+        # This handles edge cases like handwritten years
+        year_fallback = re.search(r'\b(\d{4})\b', text_block)
+        if year_fallback:
+            try:
+                year_val = int(year_fallback.group(1))
+                # Only use if it's a reasonable year range (1800-2100)
+                if 1800 <= year_val <= 2100:
+                    vehicle['year'] = year_val  # Preserve even if invalid (warnings will be generated)
+            except ValueError:
+                pass
     
     # Extract make: Common makes in the block
     # Try patterns: "Make: Toyota", "Toyota Camry", "2024 Toyota"
@@ -1244,21 +1265,22 @@ def extract_fields_from_block(text_block: str, mapping: Optional[Dict[str, Any]]
                 break
     
     # Extract mileage: Numbers with "miles" or "mi" or "Mileage: X"
+    # PRESERVE negative values - do not drop them
     # Try "Mileage: X" or "Current Mileage: X" pattern first (common in PDFs)
-    mileage_label_match = re.search(r'(?:Current\s+)?Mileage:\s*([\d,]+)', text_block, re.IGNORECASE)
+    mileage_label_match = re.search(r'(?:Current\s+)?Mileage[:\s]+(-?[\d,]+)', text_block, re.IGNORECASE)
     if mileage_label_match:
         try:
-            mileage_str = mileage_label_match.group(1).replace(',', '')
-            vehicle['mileage'] = int(mileage_str)
+            mileage_str = mileage_label_match.group(1).replace(',', '').replace(' ', '')
+            vehicle['mileage'] = int(mileage_str)  # Preserve negative values
         except ValueError:
             pass
     else:
-        # Fallback: search for "X miles" pattern
-        mileage_match = re.search(r'([\d,]+)\s*(?:miles?|mi\.?)', text_block, re.IGNORECASE)
+        # Fallback: search for "X miles" pattern (including negative values)
+        mileage_match = re.search(r'(-?[\d,]+)\s*(?:miles?|mi\.?)', text_block, re.IGNORECASE)
         if mileage_match:
             try:
-                mileage_str = mileage_match.group(1).replace(',', '')
-                vehicle['mileage'] = int(mileage_str)
+                mileage_str = mileage_match.group(1).replace(',', '').replace(' ', '')
+                vehicle['mileage'] = int(mileage_str)  # Preserve negative values
             except ValueError:
                 pass
     
@@ -1296,12 +1318,19 @@ def extract_fields_from_block(text_block: str, mapping: Optional[Dict[str, Any]]
                 vehicle['transmission'] = trans_type
     
     # Extract owner_email: "Owner Email: X" or email pattern
-    # Try "Owner Email: X" first (common in PDFs)
-    email_label_match = re.search(r'Owner\s+Email:\s*([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})', text_block, re.IGNORECASE)
+    # PRESERVE invalid email formats - warnings will be generated later
+    # Try "Owner Email: X" first (common in PDFs) - extract any value after the label
+    email_label_match = re.search(r'Owner\s+Email:\s*([^\n,]+)', text_block, re.IGNORECASE)
     if email_label_match:
-        vehicle['owner_email'] = email_label_match.group(1).lower()
+        email_value = email_label_match.group(1).strip()
+        # If it looks like a valid email, lowercase it; otherwise preserve as-is
+        if '@' in email_value and '.' in email_value:
+            vehicle['owner_email'] = email_value.lower()
+        else:
+            # Preserve invalid email format (e.g., "bad-email-format")
+            vehicle['owner_email'] = email_value
     else:
-        # Fallback: search for any email pattern
+        # Fallback: search for any email pattern (valid format)
         email_match = re.search(r'([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})', text_block)
         if email_match:
             vehicle['owner_email'] = email_match.group(1).lower()
@@ -1336,11 +1365,157 @@ def extract_fields_from_block(text_block: str, mapping: Optional[Dict[str, Any]]
             notes_clean = re.sub(r'\s*VEHICLE DETAIL SHEET\s*$', '', notes_clean, flags=re.IGNORECASE)
             if notes_clean:
                 vehicle['notes'] = notes_clean
-    else:
-        # RAW TEXT EXPECTATION — leave notes empty unless explicitly provided
-        pass
+    
+    # Generate human-readable notes from extracted fields (if notes not already set)
+    if not vehicle.get('notes'):
+        vehicle['notes'] = _generate_vehicle_notes(vehicle)
     
     return vehicle
+
+
+def _generate_vehicle_notes(vehicle: Dict[str, Any]) -> str:
+    """
+    Generate deterministic notes field following exact format:
+    {year} {make} {model} {body_style} painted {color}. {mileage} miles. Fuel: {fuel_type}. Automatic transmission.
+    
+    Rules:
+    - Only use information explicitly present in the vehicle dict
+    - Do not invent values
+    - Follow exact format: year make model body_style painted color. mileage miles. Fuel: fuel_type. Automatic transmission.
+    - Remove OCR explanations, test commentary, duplicated sentences, meta text
+    - Mileage should include commas (e.g., 38,990 miles)
+    - Fuel type should be normalized (gasoline, electric, diesel)
+    - Transmission should be normalized (automatic, manual) - always "Automatic transmission" or "Manual transmission"
+    
+    Args:
+        vehicle: Dictionary with extracted vehicle fields
+    
+    Returns:
+        Human-readable notes string, or empty string if no fields to summarize
+    """
+    # Check if we only have body_style (no meaningful content for notes)
+    # If only body_style exists without year/make/model/color/mileage/fuel/transmission, return None
+    has_meaningful_content = any([
+        vehicle.get('year'),
+        vehicle.get('make'),
+        vehicle.get('model'),
+        vehicle.get('color'),
+        vehicle.get('mileage') is not None,
+        vehicle.get('fuel_type'),
+        vehicle.get('transmission')
+    ])
+    
+    if not has_meaningful_content:
+        # Only body_style or nothing - return None (don't generate "suv.")
+        return None
+    
+    parts = []
+    
+    # Build year, make, model, body_style, color description
+    desc_parts = []
+    
+    if vehicle.get('year'):
+        try:
+            year_val = vehicle['year']
+            # Handle both int and string year values
+            if isinstance(year_val, str):
+                year_val = int(year_val.strip())
+            desc_parts.append(str(year_val))
+        except (ValueError, TypeError):
+            # Skip invalid year
+            pass
+    
+    if vehicle.get('make'):
+        make_val = str(vehicle['make']).strip()
+        if make_val:
+            desc_parts.append(make_val)
+    
+    if vehicle.get('model'):
+        model_val = str(vehicle['model']).strip()
+        if model_val:
+            desc_parts.append(model_val)
+    
+    if vehicle.get('body_style'):
+        body_style = str(vehicle['body_style']).strip().lower()
+        # Keep lowercase for body_style (sedan, truck, suv, etc.)
+        if body_style:
+            desc_parts.append(body_style)
+    
+    if vehicle.get('color'):
+        color = str(vehicle['color']).strip()
+        if color:
+            color = color.lower()  # Keep lowercase for color
+            desc_parts.append(f"painted {color}")
+    
+    # Build main description sentence
+    if desc_parts:
+        main_desc = " ".join(desc_parts)
+        # Add period if it doesn't end with one
+        if not main_desc.endswith('.'):
+            main_desc += "."
+        parts.append(main_desc)
+    
+    # Add mileage if present
+    if vehicle.get('mileage') is not None:
+        try:
+            mileage_val = vehicle['mileage']
+            # Handle both int and string mileage values
+            if isinstance(mileage_val, str):
+                # Remove commas and whitespace
+                mileage_val = mileage_val.replace(',', '').strip()
+                mileage = int(mileage_val)
+            else:
+                mileage = int(mileage_val)
+            # Format with commas
+            mileage_str = f"{mileage:,}"
+            parts.append(f"{mileage_str} miles")
+        except (ValueError, TypeError):
+            # If mileage is invalid, skip it (don't include in notes)
+            pass
+    
+    # Add fuel type if present - format: "Fuel: {fuel_type}"
+    if vehicle.get('fuel_type'):
+        fuel_type = str(vehicle['fuel_type']).strip().lower()
+        if fuel_type:
+            # Normalize fuel type
+            fuel_normalized = None
+            if 'gas' in fuel_type or 'gasoline' in fuel_type or fuel_type == 'petrol':
+                fuel_normalized = 'gasoline'
+            elif 'electric' in fuel_type or 'ev' in fuel_type:
+                fuel_normalized = 'electric'
+            elif 'diesel' in fuel_type:
+                fuel_normalized = 'diesel'
+            elif fuel_type in ['gasoline', 'electric', 'diesel', 'hybrid', 'plug-in hybrid']:
+                fuel_normalized = fuel_type
+            
+            if fuel_normalized:
+                parts.append(f"Fuel: {fuel_normalized}")
+    
+    # Add transmission if present - format: "Automatic transmission" or "Manual transmission"
+    if vehicle.get('transmission'):
+        transmission = str(vehicle['transmission']).strip().lower()
+        if transmission:
+            # Normalize transmission
+            trans_normalized = None
+            if 'auto' in transmission:
+                trans_normalized = 'Automatic'
+            elif 'manual' in transmission:
+                trans_normalized = 'Manual'
+            elif transmission in ['automatic', 'manual', 'cvt']:
+                trans_normalized = transmission.capitalize()
+            
+            if trans_normalized:
+                parts.append(f"{trans_normalized} transmission")
+    
+    # Join all parts with periods and spaces
+    if parts:
+        notes = ". ".join(parts)
+        # Ensure it ends with a period
+        if not notes.endswith('.'):
+            notes += "."
+        return notes
+    
+    return None  # Return None if no meaningful content
 
 
 def _get_vision_ocr_text_for_pdf(file_path: Path) -> str:
@@ -1563,9 +1738,9 @@ def parse_vehicle_raw_text(text: str, source_type: str = "raw") -> List[Dict[str
     blocks = split_by_vin(cleaned_text)
     logger.debug(f"[parse_vehicle_raw_text] Found {len(blocks)} VIN block(s)")
     
-    # DEBUG: Only print block count if we didn't find 6 blocks (success case disables debug)
+    # DEBUG: Only log block count if we didn't find 6 blocks (success case disables debug)
     if len(blocks) < 6:
-        print(f"[parse_vehicle_raw_text DEBUG] Found {len(blocks)} VIN block(s)")
+        logger.debug(f"[parse_vehicle_raw_text] Found {len(blocks)} VIN block(s)")
     
     # Extract vehicle fields from each block using the new extractor
     # Deduplicate by VIN to avoid processing the same vehicle twice
@@ -3037,9 +3212,18 @@ def _extract_table_with_vision_api(
         return None
     logger.info("[Vision] API key found")
     
-    # Always use gpt-4o for vision, ignore OPENAI_MODEL env var
-    vision_model = "gpt-4o"
-    logger.info(f"[Vision] Using model: {vision_model}")
+    # Use appropriate model based on source type: PDF_MODEL for PDFs, IMAGE_MODEL for images
+    from config import PDF_MODEL, IMAGE_MODEL
+    if source_type == SourceType.PDF:
+        vision_model = PDF_MODEL
+        logger.info(f"[Vision] Using PDF_MODEL: {vision_model}")
+    elif source_type == SourceType.IMAGE:
+        vision_model = IMAGE_MODEL
+        logger.info(f"[Vision] Using IMAGE_MODEL: {vision_model}")
+    else:
+        # Default to IMAGE_MODEL for other source types (shouldn't happen, but safe fallback)
+        vision_model = IMAGE_MODEL
+        logger.info(f"[Vision] Using IMAGE_MODEL (default): {vision_model}")
     
     # Initialize OpenAI client
     try:
@@ -3174,7 +3358,7 @@ def _extract_table_with_vision_api(
             system_prompt = (
                 "You are an OCR engine that extracts vehicle data from an image or PDF. "
                 "You MUST identify EVERY individual vehicle described in the document. "
-                "Return ONLY valid JSON, no explanations. "
+                "Return ONLY valid JSON, no explanations, no markdown, no additional text. "
                 "\n"
                 "Output format:\n"
                 "{\n"
@@ -3185,12 +3369,33 @@ def _extract_table_with_vision_api(
                 '  ]\n'
                 "}\n"
                 "\n"
-                "CRITICAL REQUIREMENTS:\n"
+                "CRITICAL OUTPUT REQUIREMENTS:\n"
                 "- Return exactly ONE row per vehicle\n"
                 "- Use the EXACT header names listed above (case-sensitive)\n"
-                "- For missing fields, use null (not empty string)\n"
+                "- For missing fields, use null (not empty string, not \"\", not \"N/A\")\n"
                 "- Extract ALL vehicles from the document, not just the first one\n"
                 f"- Each row must have exactly {len(canonical_schema)} values matching the {len(canonical_schema)} headers\n"
+                "- Output ONLY the JSON object - no explanatory text before or after\n"
+                "- Do NOT add markdown code blocks (```json)\n"
+                "- Do NOT add comments or descriptions\n"
+                "\n"
+                "EXTRACTION RULES (CRITICAL):\n"
+                "- Extract values EXACTLY as written in the source document\n"
+                "- Do NOT reword, summarize, paraphrase, or embellish any values\n"
+                "- Do NOT normalize or convert values (preserve original format)\n"
+                "- Do NOT infer missing values - use null if not present\n"
+                "- When uncertain, extract your best guess rather than omitting the field\n"
+                "- For invalid values (e.g., year=1899, mileage=-100), extract them anyway - validation will handle warnings\n"
+                "- Prefer extraction over omission - always attempt to extract a value if it appears in the document\n"
+                "\n"
+                "NOTES FIELD RULES (CRITICAL):\n"
+                "- If notes exist in the source, copy them VERBATIM - word-for-word, character-for-character\n"
+                "- Preserve original wording, punctuation, sentence order, and capitalization\n"
+                "- Do NOT summarize, paraphrase, rewrite, or reorder sentences\n"
+                "- Do NOT remove content unless it's clearly not vehicle-specific\n"
+                "- Do NOT add explanatory text or infer missing information\n"
+                "- If no notes are present in the source, set notes = null (not empty string)\n"
+                "- If notes contain bullets or list markers, preserve them as written\n"
                 "\n"
                 "FIELD EXTRACTION INSTRUCTIONS:\n"
                 "\n"
@@ -3210,7 +3415,7 @@ def _extract_table_with_vision_api(
             system_prompt = (
                 "You are an OCR engine that extracts vehicle data from an image or PDF. "
                 "You MUST identify EVERY individual vehicle described in the document. "
-                "Return ONLY valid JSON, no explanations. "
+                "Return ONLY valid JSON, no explanations, no markdown, no additional text. "
                 "\n"
                 "Output format:\n"
                 "{\n"
@@ -3220,7 +3425,30 @@ def _extract_table_with_vision_api(
                 '  ]\n'
                 "}\n"
                 "\n"
-                "Extract EXACT values as written - do NOT normalize, convert, or infer values.\n"
+                "CRITICAL OUTPUT REQUIREMENTS:\n"
+                "- Return exactly ONE row per vehicle\n"
+                "- Use the EXACT header names listed above (case-sensitive)\n"
+                "- For missing fields, use null (not empty string)\n"
+                "- Extract ALL vehicles from the document, not just the first one\n"
+                f"- Each row must have exactly {len(canonical_schema)} values matching the {len(canonical_schema)} headers\n"
+                "- Output ONLY the JSON object - no explanatory text before or after\n"
+                "\n"
+                "EXTRACTION RULES (CRITICAL):\n"
+                "- Extract values EXACTLY as written in the source document\n"
+                "- Do NOT reword, summarize, paraphrase, or embellish any values\n"
+                "- Do NOT normalize or convert values (preserve original format)\n"
+                "- Do NOT infer missing values - use null if not present\n"
+                "- When uncertain, extract your best guess rather than omitting the field\n"
+                "- For invalid values (e.g., year=1899, mileage=-100), extract them anyway - validation will handle warnings\n"
+                "- Prefer extraction over omission - always attempt to extract a value if it appears in the document\n"
+                "\n"
+                "NOTES FIELD RULES (CRITICAL):\n"
+                "- If notes exist in the source, copy them VERBATIM - word-for-word, character-for-character\n"
+                "- Preserve original wording, punctuation, sentence order, and capitalization\n"
+                "- Do NOT summarize, paraphrase, rewrite, or reorder sentences\n"
+                "- Do NOT remove content unless it's clearly not vehicle-specific\n"
+                "- Do NOT add explanatory text or infer missing information\n"
+                "- If no notes are present in the source, set notes = null (not empty string)\n"
             )
         
         # Process each page: try Vision first, fallback to OCR inference
@@ -3382,6 +3610,9 @@ def _extract_table_with_vision_api(
                 traceback.print_exc()
                 return None
         
+        # For IMAGE sources, collect all rows first, then aggregate into ONE vehicle after all pages
+        image_rows_collector = [] if source_type == SourceType.IMAGE else None
+        
         # Process images (PDF/IMAGE sources)
         for page_idx, img in enumerate(images):
             page_num = page_idx + 1
@@ -3434,21 +3665,31 @@ def _extract_table_with_vision_api(
                 "Extract ALL individual vehicles described on this page. "
                 "Return exactly one row per vehicle using the exact JSON format and schema from the system message. "
                 "\n\n"
-                "Follow the field extraction instructions from the system message exactly. "
-                "Each vehicle is defined by its VIN block - extract only fields within the same block as each VIN. "
-                "Do NOT reuse fields from previous vehicles."
+                "CRITICAL INSTRUCTIONS:\n"
+                "- Follow the field extraction instructions from the system message EXACTLY\n"
+                "- Each vehicle is defined by its VIN block - extract only fields within the same block as each VIN\n"
+                "- Do NOT reuse fields from previous vehicles\n"
+                "- Extract values EXACTLY as written - do NOT reword, summarize, or paraphrase\n"
+                "- For the notes field: if present, copy VERBATIM - preserve original wording, punctuation, and order\n"
+                "- If notes are missing, set notes = null (not empty string)\n"
+                "- When uncertain about a value, extract your best guess rather than omitting it\n"
+                "- For invalid values (e.g., negative mileage, invalid year), extract them anyway - do NOT drop the field\n"
             )
             
             if page_ocr_text:
                 user_prompt_text += (
                     f"\n\nOCR-extracted text from this page (vehicles separated by '--- VEHICLE SEPARATOR ---'):\n{page_ocr_text[:2000]}\n\n"
                     "Use this OCR text to help identify all vehicles and their field boundaries. "
-                    "Each section between separators represents one vehicle."
+                    "Each section between separators represents one vehicle. "
+                    "Extract values from the OCR text EXACTLY as written - do NOT modify or reword."
                 )
             
             user_prompt_text += (
-                f"\n\nReturn ONE row per vehicle with exactly {len(canonical_schema)} values matching the headers. "
-                "If a field is missing, use null (not empty string)."
+                f"\n\nOUTPUT REQUIREMENTS:\n"
+                f"- Return ONE row per vehicle with exactly {len(canonical_schema)} values matching the headers\n"
+                "- If a field is missing, use null (not empty string, not \"\", not \"N/A\")\n"
+                "- Output ONLY valid JSON - no markdown, no explanations, no additional text\n"
+                "- Do NOT wrap the JSON in code blocks (```json)\n"
             )
             
             user_content = [
@@ -3466,6 +3707,7 @@ def _extract_table_with_vision_api(
                         {"role": "user", "content": user_content},
                     ],
                     max_tokens=4000,
+                    temperature=0,  # Deterministic output - prioritize consistency over creativity
                 )
                 
                 if response.choices and response.choices[0].message.content:
@@ -3518,6 +3760,9 @@ def _extract_table_with_vision_api(
                     # Check if we already have rows from text extraction
                     if not all_rows or page_num not in vision_extracted_pages:
                         all_rows.extend(page_rows)
+                elif source_type == SourceType.IMAGE:
+                    # For IMAGE sources, collect rows for aggregation AFTER all pages are processed
+                    image_rows_collector.extend(page_rows)
                 else:
                     all_rows.extend(page_rows)
             else:
@@ -3538,6 +3783,26 @@ def _extract_table_with_vision_api(
                                         value = None
                                     canonical_row.append(value)
                                 all_rows.append(canonical_row)
+                    elif source_type == SourceType.IMAGE:
+                        # For IMAGE sources, collect blocks for aggregation AFTER all pages
+                        blocks = split_by_vin(page_ocr_text)
+                        extracted_vehicles = [extract_fields_from_block(b, mapping=mapping_config, source_type="image") for b in blocks]
+                        # Convert vehicles to canonical rows and collect for aggregation
+                        # CRITICAL: Filter out rows with invalid VINs (header tokens) during collection
+                        for vehicle in extracted_vehicles:
+                            if vehicle:
+                                vin_value = vehicle.get('vin')
+                                # Skip vehicles with invalid VINs (header tokens like "YEAR", "MAKE", etc.)
+                                if vin_value and str(vin_value).upper() in {'YEAR', 'MAKE', 'MODEL', 'COLOR', 'MILEAGE', 'VIN'}:
+                                    logger.debug(f"[IMAGE] Skipping vehicle with invalid VIN: {vin_value}")
+                                    continue
+                                canonical_row = []
+                                for field in canonical_schema:
+                                    value = vehicle.get(field)
+                                    if isinstance(value, str) and value.strip().lower() == "none":
+                                        value = None
+                                    canonical_row.append(value)
+                                image_rows_collector.append(canonical_row)
                     else:
                         # For non-PDF sources, use original fallback logic
                         fallback_row = _extract_from_ocr_text_with_fallback(page_ocr_text, page_num)
@@ -3549,6 +3814,32 @@ def _extract_table_with_vision_api(
                             all_rows.append(canonical_row)
                         else:
                             logger.debug(f"[Fallback] No data extracted from page {page_num} OCR text")
+        
+        # For IMAGE sources, aggregate all collected rows into ONE vehicle
+        if source_type == SourceType.IMAGE and image_rows_collector:
+            aggregated_vehicle = {field: None for field in canonical_schema}
+            for row in image_rows_collector:
+                for i, field in enumerate(canonical_schema):
+                    value = row[i] if i < len(row) else None
+                    # Merge: last non-null value wins (but skip invalid VINs like "YEAR")
+                    if value is not None and value != "":
+                        # Skip header tokens that might have been extracted as VINs
+                        if field == "vin" and str(value).upper() in {'YEAR', 'MAKE', 'MODEL', 'COLOR', 'MILEAGE', 'VIN'}:
+                            continue
+                        aggregated_vehicle[field] = value
+            # Convert aggregated vehicle to canonical row
+            # Only emit if we have a valid VIN (not a header token)
+            vin_value = aggregated_vehicle.get('vin')
+            if vin_value and str(vin_value).upper() not in {'YEAR', 'MAKE', 'MODEL', 'COLOR', 'MILEAGE', 'VIN'}:
+                canonical_row = []
+                for field in canonical_schema:
+                    value = aggregated_vehicle.get(field)
+                    if isinstance(value, str) and value.strip().lower() == "none":
+                        value = None
+                    canonical_row.append(value)
+                all_rows.append(canonical_row)
+            else:
+                logger.warning(f"[IMAGE] No valid VIN found after aggregation (got: {vin_value}), skipping row")
         
         # Log extraction summary
         if vision_extracted_pages:

@@ -481,15 +481,24 @@ def normalize_v2(
                 elif ai_instruction:
                     # AI-powered source - try to extract from OCR-extracted row data
                     # For OCR sources, the row dict contains extracted columns
-                    # Try fuzzy matching target_field name against row keys first
+                    # CRITICAL: Row dict keys are already canonical field names (from VEHICLE_SCHEMA_ORDER)
+                    # So try direct match FIRST before normalization/fuzzy matching
                     value = None
                     
-                    # First, try exact match on normalized target_field name
-                    normalized_target = normalize_header(target_field)
-                    value = row.get(normalized_target)
+                    # Strategy 1: Direct key match (row keys are already canonical field names)
+                    # This is the most common case for PDF/OCR sources where extract_fields_from_block
+                    # creates vehicle dicts with keys matching VEHICLE_SCHEMA_ORDER
+                    if target_field in row:
+                        value = row.get(target_field)
                     
-                    # If not found, try fuzzy matching against all row keys
+                    # Strategy 2: Normalized match (fallback for edge cases)
                     if value is None or value == "":
+                        normalized_target = normalize_header(target_field)
+                        value = row.get(normalized_target)
+                    
+                    # Strategy 3: Fuzzy matching against all row keys (last resort)
+                    if value is None or value == "":
+                        normalized_target = normalize_header(target_field)
                         best_match = None
                         best_similarity = 0.0
                         for row_key in row.keys():
@@ -621,11 +630,16 @@ def normalize_v2(
                     pass  # Format will be applied here once implemented
                 
                 # Type conversion
+                # PRESERVE invalid values - do not set to None
+                # Warnings will be generated later for invalid values
                 if value is not None and value != "":
                     try:
                         if field_type == "integer":
+                            # Preserve negative values and out-of-range values
+                            # Convert to int but keep the value even if invalid
                             value = int(float(str(value)))
                         elif field_type == "decimal":
+                            # Preserve negative values and invalid decimals
                             value = float(str(value))
                         elif field_type == "date":
                             # Normalize date to YYYY-MM-DD format
@@ -653,14 +667,16 @@ def normalize_v2(
                                 # If parsing fails, keep original but strip whitespace
                                 value = value_str
                     except (ValueError, TypeError):
+                        # Type conversion failed - preserve original value as string
+                        # Do NOT set to None - keep the extracted value
                         row_errors.append({
                             "target_field": target_field,
                             "_source_id": mapping_id,
                             "_source_row_number": row_idx,
                             "error": f"Invalid {field_type} value: {value}"
                         })
-                        # Keep original value (or None) and continue to add field
-                        value = None
+                        # Keep original value as string - do not set to None
+                        value = str(value).strip() if value else None
                 
                 # Validation
                 if value is not None and value != "":
@@ -728,6 +744,7 @@ def normalize_v2(
                             # Continue to add field with value (validation failed but field exists)
                 
                 # Always add/update target_field in row_result
+                # PRESERVE extracted values - do not drop invalid values
                 # If field doesn't exist, add it (even if None)
                 # If field exists but is None/empty, and we have a value, overwrite it
                 # This allows later variants to provide values when earlier variants failed
@@ -738,8 +755,53 @@ def normalize_v2(
                     row_result[target_field] = value
                 elif value is not None and value != "":
                     # If we already have a value, keep it (first variant wins)
+                    # BUT: if existing value is None and we have a new value, use the new value
+                    if row_result[target_field] is None:
+                        row_result[target_field] = value
                     pass
                 # If both are None/empty, keep the existing None
+            
+            # PRESERVE extracted values that mappings might have missed
+            # For unstructured sources (PDF, raw text), values are already extracted in row dict
+            # If a field is None in row_result but exists in the original row, preserve it
+            # This is critical for PDF sources where extract_fields_from_block extracts values
+            # but mappings with empty source_field might not find them
+            # CRITICAL: Preserve even invalid values (year=1899, mileage=-100, bad email)
+            # Validation will add warnings, but we must NOT drop the extracted value
+            
+            # Get all target_field names from mappings
+            all_target_fields = {m.get("target_field", "") for m in mappings if m.get("target_field")}
+            
+            for key, val in row.items():
+                # Skip metadata fields
+                if key.startswith('_'):
+                    continue
+                
+                # Skip if value is None or empty
+                if val is None or val == "":
+                    continue
+                    
+                # Try multiple matching strategies to find the target_field
+                matching_target = None
+                
+                # Strategy 1: Direct key match
+                if key in all_target_fields:
+                    matching_target = key
+                else:
+                    # Strategy 2: Normalized key match
+                    normalized_key = normalize_header(key)
+                    for mapping in mappings:
+                        target_field = mapping.get("target_field", "")
+                        if normalize_header(target_field) == normalized_key:
+                            matching_target = target_field
+                            break
+                
+                # If we found a matching target_field and it's None/empty in row_result, preserve the value
+                if matching_target:
+                    current_value = row_result.get(matching_target)
+                    # Preserve if currently None, empty string, or not set
+                    if current_value is None or current_value == "":
+                        row_result[matching_target] = val
             
             # Apply fallback inference for fields that mapping missed
             # Only infer fields that are currently None - mapping takes priority

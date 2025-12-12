@@ -16,17 +16,35 @@ from .models import OCRMetadata, TextBlock
 
 logger = logging.getLogger(__name__)
 
-# Try to load .env file for API keys
+# Try to load .env file for API keys and model configuration
 try:
     from dotenv import load_dotenv
     import os
     load_dotenv()
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+    # Import model configuration from config module
+    try:
+        import sys
+        from pathlib import Path
+        # Add parent directory (src/) to path to import config
+        config_path = Path(__file__).parent.parent
+        if str(config_path) not in sys.path:
+            sys.path.insert(0, str(config_path))
+        from config import IMAGE_MODEL
+        logger.debug(f"[OCR] Loaded IMAGE_MODEL from config: {IMAGE_MODEL}")
+    except ImportError:
+        # Fallback if config module not available - read directly from env
+        IMAGE_MODEL = os.getenv("IMAGE_MODEL", "gpt-4o")
+        logger.debug(f"[OCR] Using IMAGE_MODEL from env (config module not available): {IMAGE_MODEL}")
 except ImportError:
-    OPENAI_API_KEY = None
+    import os
+    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+    IMAGE_MODEL = os.getenv("IMAGE_MODEL", "gpt-4o")
     logger.debug("[OCR] python-dotenv not available, Vision API key must be set via environment variable")
 except Exception as e:
-    OPENAI_API_KEY = None
+    import os
+    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+    IMAGE_MODEL = os.getenv("IMAGE_MODEL", "gpt-4o")
     logger.debug(f"[OCR] Error loading .env: {e}")
 
 
@@ -415,8 +433,11 @@ def _extract_with_vision(
             img.save(buffered, format="PNG")
             img_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
         
-        # Try GPT-4o first, fallback to gpt-4-turbo
-        vision_model = "gpt-4o"
+        # Use IMAGE_MODEL from config/env, with fallback to gpt-4-turbo if configured model fails
+        vision_model = IMAGE_MODEL
+        fallback_model = "gpt-4-turbo"  # Generic fallback for vision-capable models
+        logger.info(f"[OCR Vision] Using model: {vision_model} (fallback: {fallback_model})")
+        
         try:
             response = client.chat.completions.create(
                 model=vision_model,
@@ -448,9 +469,10 @@ Return ONLY valid JSON, no markdown formatting.""".format(img_width, img_height)
                 max_tokens=4000
             )
         except Exception as e:
-            # Fallback to gpt-4-turbo if gpt-4o not available
-            if "gpt-4o" in str(e).lower():
-                vision_model = "gpt-4-turbo"
+            # Fallback to gpt-4-turbo if configured model fails (e.g., model not available)
+            logger.warning(f"[OCR Vision] Model {vision_model} failed: {e}, trying fallback {fallback_model}")
+            if vision_model != fallback_model:
+                vision_model = fallback_model
                 response = client.chat.completions.create(
                     model=vision_model,
                     messages=[
@@ -847,8 +869,11 @@ def _extract_with_vision_image(
         img.save(buffered, format="PNG")
         img_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
         
-        # Try GPT-4o first, fallback to gpt-4-turbo
-        vision_model = "gpt-4o"
+        # Use IMAGE_MODEL from config/env, with fallback to gpt-4-turbo if configured model fails
+        vision_model = IMAGE_MODEL
+        fallback_model = "gpt-4-turbo"  # Generic fallback for vision-capable models
+        logger.info(f"[OCR Vision] Using model: {vision_model} (fallback: {fallback_model})")
+        
         try:
             response = client.chat.completions.create(
                 model=vision_model,
@@ -880,9 +905,10 @@ Return ONLY valid JSON, no markdown formatting.""".format(img_width, img_height)
                 max_tokens=4000
             )
         except Exception as e:
-            # Fallback to gpt-4-turbo if gpt-4o not available
-            if "gpt-4o" in str(e).lower():
-                vision_model = "gpt-4-turbo"
+            # Fallback to gpt-4-turbo if configured model fails (e.g., model not available)
+            logger.warning(f"[OCR Vision] Model {vision_model} failed: {e}, trying fallback {fallback_model}")
+            if vision_model != fallback_model:
+                vision_model = fallback_model
                 response = client.chat.completions.create(
                     model=vision_model,
                     messages=[
