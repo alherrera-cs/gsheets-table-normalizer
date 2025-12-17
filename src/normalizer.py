@@ -182,6 +182,141 @@ def _prepare_rows(raw_data: List[List[Any]], header_row_index: int, file_is_head
         return rows2d_to_objects(raw_data, header_row_index=header_row_index)
 
 
+def promote_fields_from_notes(row_result: Dict[str, Any]) -> None:
+    """
+    Promote body_style, fuel_type, transmission, and mileage from notes field
+    if those fields are currently None.
+    
+    Uses simple keyword/regex matching - no AI, no new dependencies.
+    """
+    notes = row_result.get("notes")
+    if not notes or not isinstance(notes, str):
+        return
+    
+    notes_lower = notes.lower()
+    
+    # Extract body_style if None
+    if row_result.get("body_style") is None:
+        body_styles = ['sedan', 'truck', 'suv', 'crossover', 'coupe', 'convertible', 'wagon', 'hatchback']
+        for style in body_styles:
+            if re.search(rf'\b{re.escape(style)}\b', notes_lower):
+                row_result["body_style"] = style
+                break
+    
+    # Extract fuel_type if None
+    if row_result.get("fuel_type") is None:
+        fuel_match = re.search(r'fuel[:\s]+(\w+)', notes_lower)
+        if fuel_match:
+            fuel_val = fuel_match.group(1).lower()
+            if fuel_val in ['gas', 'gasoline']:
+                row_result["fuel_type"] = "gasoline"
+            elif fuel_val in ['diesel', 'electric', 'hybrid']:
+                row_result["fuel_type"] = fuel_val
+        else:
+            # Try keyword search
+            if re.search(r'\b(gas|gasoline)\b', notes_lower):
+                row_result["fuel_type"] = "gasoline"
+            elif re.search(r'\bdiesel\b', notes_lower):
+                row_result["fuel_type"] = "diesel"
+            elif re.search(r'\belectric\b', notes_lower):
+                row_result["fuel_type"] = "electric"
+            elif re.search(r'\bhybrid\b', notes_lower):
+                row_result["fuel_type"] = "hybrid"
+    
+    # Extract transmission if None
+    if row_result.get("transmission") is None:
+        trans_match = re.search(r'transmission[:\s]+(\w+)', notes_lower)
+        if trans_match:
+            trans_val = trans_match.group(1).lower()
+            if trans_val in ['auto', 'automatic']:
+                row_result["transmission"] = "automatic"
+            elif trans_val == 'manual':
+                row_result["transmission"] = "manual"
+            elif trans_val == 'cvt':
+                row_result["transmission"] = "cvt"
+        else:
+            # Try keyword search
+            if re.search(r'\b(automatic|auto)\b', notes_lower):
+                row_result["transmission"] = "automatic"
+            elif re.search(r'\bmanual\b', notes_lower):
+                row_result["transmission"] = "manual"
+            elif re.search(r'\bcvt\b', notes_lower):
+                row_result["transmission"] = "cvt"
+    
+    # Extract mileage if None
+    if row_result.get("mileage") is None:
+        mileage_match = re.search(r'(-?[\d,]+)\s*(?:miles?|mileage)', notes_lower)
+        if mileage_match:
+            try:
+                mileage_str = mileage_match.group(1).replace(',', '').replace(' ', '')
+                row_result["mileage"] = int(mileage_str)
+            except (ValueError, TypeError):
+                pass
+
+
+def correct_vin_once(vin: Optional[str]) -> Optional[str]:
+    """
+    Apply at most one character correction to VIN for handwritten/OCR sources.
+    Does not loop or guess aggressively.
+    
+    Common OCR errors:
+    - '0' vs 'O' (O is invalid in VIN, so 0 is correct)
+    - '1' vs 'I' (I is invalid in VIN, so 1 is correct)
+    - '5' vs 'S'
+    - '8' vs 'B'
+    - 'Z' vs '7'
+    """
+    if not vin or not isinstance(vin, str) or len(vin) != 17:
+        return vin
+    
+    vin_upper = vin.upper()
+    # VIN cannot contain I, O, Q
+    # If we see these, try single character corrections
+    invalid_chars = {'I', 'O', 'Q'}
+    
+    for i, char in enumerate(vin_upper):
+        if char in invalid_chars:
+            # Try common corrections
+            if char == 'I':
+                corrected = vin_upper[:i] + '1' + vin_upper[i+1:]
+            elif char == 'O':
+                corrected = vin_upper[:i] + '0' + vin_upper[i+1:]
+            elif char == 'Q':
+                corrected = vin_upper[:i] + '0' + vin_upper[i+1:]  # Q -> 0 is common
+            else:
+                continue
+            
+            # Validate: must have at least 2 digits
+            if sum(c.isdigit() for c in corrected) >= 2:
+                return corrected
+            # Only correct one character, then return
+            break
+    
+    # Also check for common digit/letter confusions (only if no invalid chars found)
+    # These are less certain, so only apply if VIN looks problematic
+    digit_count = sum(c.isdigit() for c in vin_upper)
+    if digit_count < 2:
+        # Try one correction: look for common misreads
+        for i, char in enumerate(vin_upper):
+            if char == 'S' and i > 0:  # S might be 5
+                corrected = vin_upper[:i] + '5' + vin_upper[i+1:]
+                if sum(c.isdigit() for c in corrected) >= 2:
+                    return corrected
+                break
+            elif char == 'B' and i > 0:  # B might be 8
+                corrected = vin_upper[:i] + '8' + vin_upper[i+1:]
+                if sum(c.isdigit() for c in corrected) >= 2:
+                    return corrected
+                break
+            elif char == 'Z' and i > 0:  # Z might be 7
+                corrected = vin_upper[:i] + '7' + vin_upper[i+1:]
+                if sum(c.isdigit() for c in corrected) >= 2:
+                    return corrected
+                break
+    
+    return vin
+
+
 def _generate_warnings(row_result: Dict[str, Any]) -> List[str]:
     """
     Generate data quality warnings for a row.
@@ -194,8 +329,23 @@ def _generate_warnings(row_result: Dict[str, Any]) -> List[str]:
     # Only check if this is a vehicle record (has vin or vehicle_id field)
     if "vin" in row_result or "vehicle_id" in row_result:
         year = row_result.get("year")
-        if year is not None and (year < 1990 or year > 2035):
-            warnings.append("invalid_year")
+        # SAFEGUARD: Handle both int and string year values
+        if year is not None:
+            try:
+                # Convert to int if string
+                year_int = int(year) if isinstance(year, str) else year
+                if year_int < 1990 or year_int > 2035:
+                    warnings.append("invalid_year")
+                    # #region agent log
+                    if row_result.get('vin') == 'ST420RJ98FDHKL4E':
+                        import json
+                        from datetime import datetime
+                        with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
+                            f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H5","location":"normalizer.py:198","message":"PDF Row 6: Warning generated","data":{"year":year,"year_int":year_int,"warnings":warnings},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
+                    # #endregion
+            except (ValueError, TypeError):
+                # If year can't be converted to int, skip warning
+                pass
     
     # Driver-specific warnings
     # Date of birth warning: if date_of_birth is not None, extract year and check
@@ -212,15 +362,31 @@ def _generate_warnings(row_result: Dict[str, Any]) -> List[str]:
     
     # Negative mileage warning: if mileage is not None and mileage < 0
     mileage = row_result.get("mileage")
-    if mileage is not None and mileage < 0:
-        warnings.append("negative_mileage")
+    if mileage is not None:
+        # Handle both int and string mileage values
+        try:
+            mileage_int = int(mileage) if isinstance(mileage, str) else mileage
+            if mileage_int < 0:
+                warnings.append("negative_mileage")
+        except (ValueError, TypeError):
+            # If mileage can't be converted to int, skip warning
+            pass
     
     # Invalid email warning: basic check using pattern: value contains "@" and "." and no spaces
+    # SAFEGUARD: Check email even if it's not a valid format (preserve invalid emails)
     owner_email = row_result.get("owner_email")
     if owner_email is not None and owner_email != "":
-        email_str = str(owner_email)
-        if "@" not in email_str or "." not in email_str or " " in email_str:
+        email_str = str(owner_email).strip()
+        # Check if it's a valid email format
+        if email_str and ("@" not in email_str or "." not in email_str or " " in email_str):
             warnings.append("invalid_email")
+            # #region agent log
+            if row_result.get('vin') == 'ST420RJ98FDHKL4E':
+                import json
+                from datetime import datetime
+                with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
+                    f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H5","location":"normalizer.py:223","message":"PDF Row 6: Email warning generated","data":{"owner_email":owner_email,"email_str":email_str,"warnings":warnings},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
+            # #endregion
     
     # Transmission warning: allowed values are automatic, manual, cvt (case-insensitive)
     transmission = row_result.get("transmission")
@@ -372,6 +538,9 @@ def normalize_v2(
                     extraction_source_type = SourceType.AIRTABLE  # Use Airtable JSON handler
                     logger.debug("normalize_v2: overriding source_type to AIRTABLE for image metadata JSON file")
         
+        # Track actual source type for promotion/VIN correction decisions (after all overrides)
+        actual_source_type = extraction_source_type
+        
         # Prepare source for extraction
         logger.debug(f"[normalize_v2] Preparing source for extraction. mapping source_type={source_type}, extraction_source_type={extraction_source_type}, source={source}")
         
@@ -490,6 +659,13 @@ def normalize_v2(
                     # creates vehicle dicts with keys matching VEHICLE_SCHEMA_ORDER
                     if target_field in row:
                         value = row.get(target_field)
+                        # #region agent log
+                        if row.get('vin') == 'ST420RJ98FDHKL4E' and target_field in ['year', 'make', 'model', 'color', 'owner_email', 'transmission']:
+                            import json
+                            from datetime import datetime
+                            with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
+                                f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H3","location":"normalizer.py:492","message":"PDF Row 6: Direct key match","data":{"target_field":target_field,"value":value,"row_has_key":target_field in row,"row_keys":list(row.keys())[:10]},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
+                        # #endregion
                     
                     # Strategy 2: Normalized match (fallback for edge cases)
                     if value is None or value == "":
@@ -760,8 +936,15 @@ def normalize_v2(
                         row_result[target_field] = value
                     pass
                 # If both are None/empty, keep the existing None
+                # #region agent log - Enhanced debugging for PDF Row 6
+                if row.get('vin') == 'ST420RJ98FDHKL4E' and target_field in ['year', 'make', 'model', 'color', 'owner_email', 'transmission']:
+                    import json
+                    from datetime import datetime
+                    with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
+                        f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H4","location":"normalizer.py:753","message":"PDF Row 6: After mapping assignment","data":{"target_field":target_field,"value":value,"value_type":type(value).__name__,"row_result_value":row_result.get(target_field),"row_result_value_type":type(row_result.get(target_field)).__name__ if row_result.get(target_field) is not None else None,"row_has_key":target_field in row,"source_field":mapping.get("source_field"),"has_ai_instruction":bool(mapping.get("ai_instruction"))},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
+                # #endregion
             
-            # PRESERVE extracted values that mappings might have missed
+            # SAFEGUARD: PRESERVE extracted values that mappings might have missed
             # For unstructured sources (PDF, raw text), values are already extracted in row dict
             # If a field is None in row_result but exists in the original row, preserve it
             # This is critical for PDF sources where extract_fields_from_block extracts values
@@ -772,13 +955,22 @@ def normalize_v2(
             # Get all target_field names from mappings
             all_target_fields = {m.get("target_field", "") for m in mappings if m.get("target_field")}
             
+            # SAFEGUARD: Track which fields were in original row but missing in row_result
+            preserved_fields = []
+            
             for key, val in row.items():
                 # Skip metadata fields
                 if key.startswith('_'):
                     continue
                 
-                # Skip if value is None or empty
-                if val is None or val == "":
+                # CRITICAL FIX: For Vision-extracted rows, preserve ALL fields (even None/empty)
+                # This ensures fields extracted by Vision API survive to normalization for warning generation
+                # Only skip if value is None AND we're not dealing with a Vision-extracted row
+                is_vision_extracted = row.get("_is_vision_extracted", False)
+                
+                # For Vision-extracted rows: preserve all fields, even None (for warning generation)
+                # For OCR-extracted rows: only preserve non-None values (existing behavior)
+                if not is_vision_extracted and (val is None or val == ""):
                     continue
                     
                 # Try multiple matching strategies to find the target_field
@@ -799,9 +991,56 @@ def normalize_v2(
                 # If we found a matching target_field and it's None/empty in row_result, preserve the value
                 if matching_target:
                     current_value = row_result.get(matching_target)
-                    # Preserve if currently None, empty string, or not set
-                    if current_value is None or current_value == "":
+                    # For Vision-extracted rows: preserve even None values (for warning generation)
+                    # For OCR-extracted rows: only preserve if currently None/empty
+                    if is_vision_extracted:
+                        # Vision-extracted: preserve all values, even None
                         row_result[matching_target] = val
+                        if val is not None and val != "":
+                            preserved_fields.append(matching_target)
+                    elif current_value is None or current_value == "":
+                        # OCR-extracted: only preserve if currently None/empty (existing behavior)
+                        row_result[matching_target] = val
+                        preserved_fields.append(matching_target)
+                    
+                    # #region agent log
+                    if row.get('vin') == 'ST420RJ98FDHKL4E' and matching_target in ['year', 'make', 'model', 'color', 'owner_email', 'transmission']:
+                        import json
+                        from datetime import datetime
+                        with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
+                            f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H4","location":"normalizer.py:799","message":"PDF Row 6: Safeguard preserved value","data":{"target_field":matching_target,"value":val,"current_value":current_value,"is_vision_extracted":is_vision_extracted},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
+                    # #endregion
+            
+            # CRITICAL FIX: For Vision-extracted rows, directly preserve ALL fields from row dict
+            # This ensures fields extracted by Vision API (even if None) are preserved for warning generation
+            # The safeguard above only preserves fields that match target_field in mappings,
+            # but Vision-extracted rows should preserve ALL canonical fields regardless of mapping
+            is_vision_extracted = row.get("_is_vision_extracted", False)
+            if is_vision_extracted:
+                # For Vision-extracted rows, directly copy all canonical fields from row to row_result
+                # This ensures fields are preserved even if they don't match any mapping target_field
+                from schema import VEHICLE_SCHEMA_ORDER
+                for field_name in VEHICLE_SCHEMA_ORDER:
+                    # Only set if not already set (mappings take priority)
+                    if field_name not in row_result or row_result.get(field_name) is None:
+                        row_value = row.get(field_name)
+                        # Preserve even None values (for warning generation)
+                        row_result[field_name] = row_value
+                        if row_value is not None and row_value != "":
+                            preserved_fields.append(field_name)
+            
+            # SAFEGUARD: Field preservation validation - log warning if critical fields are still missing
+            if row.get('vin'):
+                critical_fields = ['year', 'make', 'model']
+                missing_critical = [f for f in critical_fields if not row_result.get(f)]
+                if missing_critical:
+                    # Enhanced debugging for PDF Row 6
+                    if row.get('vin') == 'ST420RJ98FDHKL4E':
+                        import json
+                        from datetime import datetime
+                        with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
+                            f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H5","location":"normalizer.py:860","message":"PDF Row 6: Missing critical fields after preservation","data":{"missing_critical":missing_critical,"preserved_fields":preserved_fields,"row_keys":list(row.keys())[:15],"row_values":{k:row.get(k) for k in missing_critical if k in row},"row_result_values":{k:row_result.get(k) for k in missing_critical}},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
+                    logger.warning(f"[normalize_v2] VIN {row.get('vin')}: Missing critical fields after preservation: {missing_critical}. Preserved fields: {preserved_fields}")
             
             # Apply fallback inference for fields that mapping missed
             # Only infer fields that are currently None - mapping takes priority
@@ -814,7 +1053,16 @@ def normalize_v2(
                 # For normal files, skip header row
                 raw_row_idx = header_row_index + row_idx
             raw_row_values = raw_data[raw_row_idx] if raw_row_idx < len(raw_data) else None
+            # Preserve non-null values before fallback inference
+            preserved_before_inference = {}
+            for key, val in row_result.items():
+                if val is not None and val != "":
+                    preserved_before_inference[key] = val
             row_result = apply_fallback_inference(row, row_result, raw_row_values)
+            # Restore any fields that were non-null before inference but became None afterward
+            for key, val in preserved_before_inference.items():
+                if row_result.get(key) is None or row_result.get(key) == "":
+                    row_result[key] = val
             
             # Check required fields after all variants have been tried
             # Only check the first/primary required mapping for each target_field (avoid duplicates)
@@ -1085,6 +1333,19 @@ def normalize_v2(
                     claim_type = str(row_result["claim_type"]).strip().lower()
                     if claim_type:
                         row_result["claim_type"] = claim_type
+            
+            # Promote fields ONLY for handwritten OCR sources
+            if actual_source_type in {SourceType.PDF, SourceType.IMAGE} and row.get("_is_handwritten"):
+                promote_fields_from_notes(row_result)
+            
+            # Correct VIN ONLY for handwritten OCR sources (NOT for Vision-extracted sources)
+            # Vision-extracted VINs should be preserved exactly as extracted (no correction)
+            if actual_source_type in {SourceType.PDF, SourceType.IMAGE} and row.get("_is_handwritten") and not row.get("_is_vision_extracted"):
+                vin = row_result.get("vin")
+                if vin:
+                    corrected_vin = correct_vin_once(vin)
+                    if corrected_vin != vin:
+                        row_result["vin"] = corrected_vin
             
             # Add warnings for data quality issues
             row_result["_warnings"] = _generate_warnings(row_result)

@@ -407,6 +407,68 @@ def extract_from_source(
         raise ValueError(f"Unknown or unsupported source type: {source_type}")
 
 
+def _is_pdf_scanned_or_handwritten(pdf_path: Path, confidence_threshold: float = 0.5) -> Tuple[bool, Optional[str]]:
+    """
+    Detect if a PDF is scanned or handwritten (no embedded text OR low OCR confidence).
+    
+    Args:
+        pdf_path: Path to PDF file
+        confidence_threshold: Minimum OCR confidence to consider PDF as structured (default: 0.5)
+    
+    Returns:
+        Tuple of (is_scanned, reason)
+        - is_scanned: True if PDF should be treated as scanned/handwritten
+        - reason: Explanation string (None if not scanned)
+    """
+    try:
+        from ocr.reader import extract_text_from_pdf
+        
+        # Quick check: Try to extract embedded text using PyPDF2
+        has_embedded_text = False
+        try:
+            import PyPDF2
+            with open(pdf_path, 'rb') as f:
+                pdf_reader = PyPDF2.PdfReader(f)
+                page_count = len(pdf_reader.pages)
+                
+                # Check first few pages for embedded text
+                pages_to_check = min(3, page_count)
+                for page_num in range(pages_to_check):
+                    page = pdf_reader.pages[page_num]
+                    page_text = page.extract_text()
+                    if page_text.strip():
+                        has_embedded_text = True
+                        break
+        except Exception:
+            # If we can't read with PyPDF2, assume no embedded text
+            has_embedded_text = False
+        
+        # If no embedded text, it's definitely scanned
+        if not has_embedded_text:
+            logger.info(f"[PDF Detection] No embedded text found in {pdf_path.name} - treating as scanned/handwritten")
+            return True, "no_embedded_text"
+        
+        # If embedded text exists, check OCR confidence
+        # Extract text with OCR to get confidence score
+        text_blocks, metadata = extract_text_from_pdf(pdf_path, enable_vision=False)
+        
+        # Check confidence from metadata
+        if metadata and hasattr(metadata, 'confidence'):
+            confidence = metadata.confidence
+            if confidence < confidence_threshold:
+                logger.info(f"[PDF Detection] Low OCR confidence ({confidence:.2f} < {confidence_threshold}) in {pdf_path.name} - treating as scanned/handwritten")
+                return True, f"low_confidence_{confidence:.2f}"
+        
+        # If we have embedded text and good confidence, it's structured
+        logger.debug(f"[PDF Detection] PDF {pdf_path.name} has embedded text and good confidence - treating as structured")
+        return False, None
+        
+    except Exception as e:
+        logger.warning(f"[PDF Detection] Error detecting PDF type for {pdf_path.name}: {e}, defaulting to scanned")
+        # On error, default to scanned (safer for handwritten documents)
+        return True, f"detection_error_{str(e)[:50]}"
+
+
 def _is_ocr_result_unusable(rows_2d: List[List[Any]]) -> Tuple[bool, str]:
     """
     Check if OCR extraction result is unusable and should trigger Vision API fallback.
@@ -461,6 +523,64 @@ def _is_ocr_result_unusable(rows_2d: List[List[Any]]) -> Tuple[bool, str]:
     return (False, "")
 
 
+# Vision API filler words that should be removed from extracted values
+VISION_FILLER_WORDS = [
+    "is", "was", "are", "described", "described as", "listed as", "shown as", "marked as"
+]
+
+
+def cleanup_vision_value(value: Optional[str]) -> Optional[str]:
+    """
+    Clean up Vision API extracted values by removing filler words and trailing punctuation.
+    
+    Removes common filler phrases like "is", "was", "described", "described as" from the start of values.
+    Also removes trailing punctuation (periods, commas).
+    
+    Examples:
+        "is automatic" -> "automatic"
+        "described as manual" -> "manual"
+        "described" -> None
+        "is" -> None
+    
+    Args:
+        value: Raw value from Vision API (string or None)
+    
+    Returns:
+        Cleaned value string, or None if value is empty/None after cleaning
+    """
+    if not value or not isinstance(value, str):
+        return value
+    
+    import re
+    
+    v = value.strip()
+    if not v:
+        return None
+    
+    # Convert to lowercase for comparison, but preserve original case
+    v_lower = v.lower()
+    
+    # Remove filler words/phrases from the start (try longer phrases first)
+    # Sort by length descending to match longer phrases first
+    sorted_phrases = sorted(VISION_FILLER_WORDS, key=len, reverse=True)
+    
+    for phrase in sorted_phrases:
+        # Check if value starts with phrase followed by space
+        if v_lower.startswith(phrase + " "):
+            v = v[len(phrase):].strip()
+            v_lower = v.lower()
+            # Continue checking in case there are multiple filler words
+        # Also check if value is exactly the phrase (edge case)
+        elif v_lower == phrase:
+            return None
+    
+    # Remove trailing punctuation (periods, commas)
+    v = re.sub(r'[.,]+$', '', v).strip()
+    
+    # Return None if empty after cleaning
+    return v if v else None
+
+
 def _normalize_vision_value(field_name: str, value: Any, preserve_raw: bool = True) -> Any:
     """
     Normalize values from Vision API output according to vehicle schema rules.
@@ -479,16 +599,25 @@ def _normalize_vision_value(field_name: str, value: Any, preserve_raw: bool = Tr
     if value is None or value == "" or (isinstance(value, str) and value.strip().lower() in ['none', 'null', '']):
         return None
     
+    # Clean up Vision API filler words BEFORE normalization
+    if isinstance(value, str):
+        value = cleanup_vision_value(value)
+        if value is None:
+            return None
+    
     value_str = str(value).strip()
     
     # For PDF sources (preserve_raw=True), preserve exact values as extracted by Vision
+    # CRITICAL: Preserve raw string values when type conversion fails (instead of returning None)
+    # This allows normalize_v2 to generate warnings for invalid values
     if preserve_raw:
         # Type conversions only (no validation or normalization)
         if field_name == "year":
             try:
                 return int(value_str)
             except (ValueError, TypeError):
-                return None
+                # Preserve raw string value if conversion fails - let normalize_v2 generate warnings
+                return value_str
         
         if field_name == "mileage":
             try:
@@ -496,18 +625,22 @@ def _normalize_vision_value(field_name: str, value: Any, preserve_raw: bool = Tr
                 mileage_str = value_str.replace(",", "").replace(" ", "")
                 return int(mileage_str)  # Preserve negative values
             except (ValueError, TypeError):
-                return None
+                # Preserve raw string value if conversion fails - let normalize_v2 generate warnings
+                return value_str
         
         if field_name == "weight":
             try:
                 weight_str = value_str.replace(",", "").replace(" ", "")
-                return int(weight_str) if int(weight_str) >= 0 else None
+                weight_int = int(weight_str)
+                # Preserve negative weights as string (let normalize_v2 handle warnings)
+                return weight_int if weight_int >= 0 else value_str
             except (ValueError, TypeError):
-                return None
+                # Preserve raw string value if conversion fails - let normalize_v2 generate warnings
+                return value_str
         
         # No special PDF handling - use same normalization as other sources
         
-        # VIN: uppercase (still needed for consistency)
+        # VIN: uppercase (still needed for consistency) - preserve exactly as extracted, no correction
         if field_name == "vin":
             return value_str.upper()
         
@@ -522,13 +655,16 @@ def _normalize_vision_value(field_name: str, value: Any, preserve_raw: bool = Tr
     
     # For non-PDF sources, apply normalization but PRESERVE invalid values
     # Type conversions for numeric fields - preserve invalid values, warnings will be generated later
+    # CRITICAL: Preserve raw string values when type conversion fails (instead of returning None)
+    # This allows normalize_v2 to generate warnings for invalid values
     if field_name == "year":
         try:
             year = int(value_str)
             # Preserve invalid years - do not return None
             return year
         except (ValueError, TypeError):
-            return None
+            # Preserve raw string value if conversion fails - let normalize_v2 generate warnings
+            return value_str
     
     if field_name == "mileage":
         try:
@@ -538,15 +674,18 @@ def _normalize_vision_value(field_name: str, value: Any, preserve_raw: bool = Tr
             # Preserve negative mileage - do not return None
             return mileage
         except (ValueError, TypeError):
-            return None
+            # Preserve raw string value if conversion fails - let normalize_v2 generate warnings
+            return value_str
     
     if field_name == "weight":
         try:
             weight_str = value_str.replace(",", "").replace(" ", "")
-            weight = int(weight_str)
-            return weight if weight >= 0 else None
+            weight_int = int(weight_str)
+            # Preserve negative weights as string (let normalize_v2 handle warnings)
+            return weight_int if weight_int >= 0 else value_str
         except (ValueError, TypeError):
-            return None
+            # Preserve raw string value if conversion fails - let normalize_v2 generate warnings
+            return value_str
     
     # Normalize transmission
     if field_name == "transmission":
@@ -854,6 +993,157 @@ def _extract_notes_from_text(text: str, vehicle: Dict[str, Any]) -> Optional[str
     return None
 
 
+def _extract_document_level_defaults(full_ocr_text: str, source_type: str, file_path: Optional[Path] = None) -> Dict[str, Any]:
+    """
+    Pre-split extraction: Scan full OCR text to extract document-level defaults
+    for body_style, fuel_type, transmission, and mileage.
+    
+    These fields may appear in the full text but be lost during VIN-based splitting.
+    Only applies to handwritten PDF/image or PNG image sources.
+    
+    Args:
+        full_ocr_text: Full OCR text before splitting
+        source_type: Source type ("pdf" or "image")
+        file_path: Optional file path to check for handwriting indicators
+    
+    Returns:
+        Dict with extracted defaults (only fields that were found, None for others)
+    """
+    import re
+    import json
+    from datetime import datetime
+    
+    # #region agent log
+    with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
+        f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H1","location":"sources.py:921","message":"_extract_document_level_defaults: Entry","data":{"source_type":source_type,"text_length":len(full_ocr_text),"text_preview":full_ocr_text[:200] if full_ocr_text else None,"file_path":str(file_path) if file_path else None},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
+    # #endregion
+    
+    defaults = {
+        'body_style': None,
+        'fuel_type': None,
+        'transmission': None,
+        'mileage': None
+    }
+    
+    # Only apply for PDF/image sources
+    if source_type not in ("pdf", "image"):
+        # #region agent log
+        with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
+            f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H2","location":"sources.py:946","message":"_extract_document_level_defaults: Early return (wrong source_type)","data":{"source_type":source_type},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
+        # #endregion
+        return defaults
+    
+    # Check if file path indicates handwriting (more reliable than OCR text analysis)
+    is_handwritten_by_path = False
+    if file_path:
+        file_path_str = str(file_path).lower()
+        is_handwritten_by_path = any(keyword in file_path_str for keyword in ['handwritten', 'hand'])
+    
+    # Check if this is likely handwritten (no structured labels in full text)
+    # BUT: OCR from handwritten docs can still produce labels, so we also check file path
+    has_structured_labels = bool(re.search(r'\b(Make|Model|Year|Color|Mileage|Transmission|Fuel|Body)[:\s]', full_ocr_text, re.IGNORECASE))
+    is_likely_handwritten_by_text = not has_structured_labels and len(full_ocr_text) > 50
+    
+    # If file path indicates handwriting, treat as handwritten even if labels are present
+    is_likely_handwritten = is_handwritten_by_path or is_likely_handwritten_by_text
+    
+    # #region agent log
+    with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
+        f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H2","location":"sources.py:951","message":"_extract_document_level_defaults: Handwriting check","data":{"has_structured_labels":has_structured_labels,"is_likely_handwritten_by_text":is_likely_handwritten_by_text,"is_handwritten_by_path":is_handwritten_by_path,"is_likely_handwritten":is_likely_handwritten,"text_length":len(full_ocr_text)},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
+    # #endregion
+    
+    # Apply only for handwritten docs or all image sources (PNG images)
+    if not (is_likely_handwritten or source_type == "image"):
+        # #region agent log
+        with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
+            f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H2","location":"sources.py:954","message":"_extract_document_level_defaults: Early return (not handwritten/image)","data":{"is_likely_handwritten":is_likely_handwritten,"source_type":source_type},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
+        # #endregion
+        return defaults
+    
+    # #region agent log
+    with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
+        f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H3","location":"sources.py:957","message":"_extract_document_level_defaults: Running extraction","data":{"source_type":source_type,"is_handwritten":is_likely_handwritten,"full_text_length":len(full_ocr_text),"full_text":full_ocr_text},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
+    # #endregion
+    
+    text_lower = full_ocr_text.lower()
+    
+    # Extract body_style: Look for keywords anywhere in full text
+    if defaults['body_style'] is None:
+        body_styles = ['sedan', 'truck', 'suv', 'crossover', 'coupe', 'convertible', 'wagon', 'hatchback']
+        for style in body_styles:
+            if re.search(rf'\b{re.escape(style)}\b', text_lower):
+                defaults['body_style'] = style
+                # #region agent log
+                with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
+                    f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H3","location":"sources.py:963","message":"_extract_document_level_defaults: Found body_style","data":{"body_style":style,"text_snippet":full_ocr_text[max(0,full_ocr_text.lower().find(style)-20):full_ocr_text.lower().find(style)+len(style)+20]},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
+                # #endregion
+                break
+    
+    # Extract fuel_type: Look for keywords anywhere in full text
+    if defaults['fuel_type'] is None:
+        if re.search(r'\b(gas|gasoline)\b', text_lower):
+            defaults['fuel_type'] = 'gasoline'
+            # #region agent log
+            with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
+                f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H3","location":"sources.py:971","message":"_extract_document_level_defaults: Found fuel_type","data":{"fuel_type":"gasoline"},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
+            # #endregion
+        elif re.search(r'\bdiesel\b', text_lower):
+            defaults['fuel_type'] = 'diesel'
+            # #region agent log
+            with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
+                f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H3","location":"sources.py:971","message":"_extract_document_level_defaults: Found fuel_type","data":{"fuel_type":"diesel"},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
+            # #endregion
+        elif re.search(r'\belectric\b', text_lower):
+            defaults['fuel_type'] = 'electric'
+        elif re.search(r'\bhybrid\b', text_lower):
+            defaults['fuel_type'] = 'hybrid'
+    
+    # Extract transmission: Look for keywords anywhere in full text
+    if defaults['transmission'] is None:
+        if re.search(r'\b(automatic|auto)\b', text_lower):
+            defaults['transmission'] = 'automatic'
+            # #region agent log
+            with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
+                f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H3","location":"sources.py:981","message":"_extract_document_level_defaults: Found transmission","data":{"transmission":"automatic"},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
+            # #endregion
+        elif re.search(r'\bmanual\b', text_lower):
+            defaults['transmission'] = 'manual'
+        elif re.search(r'\bcvt\b', text_lower):
+            defaults['transmission'] = 'cvt'
+    
+    # Extract mileage: Look for patterns in full text
+    if defaults['mileage'] is None:
+        mileage_patterns = [
+            r'(?:mileage|milage)[:\s]+([\d,]+)',  # "Mileage: 100,245" or "Milage: 100,245" (handles typo)
+            r'(-?[\d,]+)\s*(?:miles?|mi\.?)',  # "100,245 miles" or "-150 miles"
+            r'about\s+([\d,]+)\s*(?:miles?|mi\.?)',  # "about 100,245 miles"
+            r'([\d,]+)\s*(?:miles?|mi\.?)\s+on\s+(?:the\s+)?odometer',  # "100,245 miles on odometer"
+            r'odometer[:\s]+([\d,]+)',  # "odometer: 100,245"
+        ]
+        for pattern in mileage_patterns:
+            mileage_match = re.search(pattern, full_ocr_text, re.IGNORECASE)
+            if mileage_match:
+                try:
+                    mileage_str = mileage_match.group(1).replace(',', '').replace(' ', '')
+                    defaults['mileage'] = int(mileage_str)  # Preserve negative values
+                    # #region agent log
+                    with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
+                        f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H3","location":"sources.py:991","message":"_extract_document_level_defaults: Found mileage","data":{"mileage":defaults['mileage'],"pattern":pattern},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
+                    # #endregion
+                    break
+                except ValueError:
+                    continue
+    
+    # Debug: Log what we found
+    found_fields = {k: v for k, v in defaults.items() if v is not None}
+    # #region agent log
+    with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
+        f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H3","location":"sources.py:1008","message":"_extract_document_level_defaults: Exit","data":{"found_fields":found_fields,"all_defaults":defaults},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
+    # #endregion
+    
+    return defaults
+
+
 def split_by_vin(text: str) -> List[str]:
     """
     Non-overlapping segmentation of OCR or raw text into per-vehicle text blocks.
@@ -869,10 +1159,16 @@ def split_by_vin(text: str) -> List[str]:
     vin_regex = r'VIN[#\s:)]+\s*([A-Z0-9]{10,20})|([A-HJ-NPR-Z0-9]{17})\b|([A-Z0-9]{10,16})\b'
     matches = list(re.finditer(vin_regex, text, re.IGNORECASE | re.MULTILINE))
     
-    # Filter out false positives (common words that match the pattern)
+    # SAFEGUARD: Filter out false positives (common words that match the pattern)
+    # Expanded list to include all header tokens that might be misidentified as VINs
+    # Note: All comparisons are case-insensitive (converted to uppercase)
     excluded_words = {'DEALERSHIP', 'IDENTIFICATION', 'TRANSMISSION', 'DESCRIPTION', 
                       'INFORMATION', 'REGISTRATION', 'DOCUMENTATION', 'SPECIFICATION',
-                      'AUTOMATIC', 'MANUAL'}
+                      'AUTOMATIC', 'MANUAL', 'YEAR', 'MAKE', 'MODEL', 'COLOR', 'MILEAGE', 
+                      'VIN', 'BODY_STYLE', 'FUEL_TYPE', 'OWNER_EMAIL', 'NOTES', 'VEHICLE_ID',
+                      'EFFECTIVE_DATE', 'TRIM', 'WEIGHT', 'BODY_TYPE', 'CURRENT_MILEAGE',
+                      'EXTERIOR_COLOR', 'FUEL', 'BODY', 'PAINTED', 'GASOLINE', 'CURRENT', 
+                      'EXTERIOR', 'ADDITIONAL', 'DETAIL', 'SHEET', 'STYLE', 'TYPE', 'EMAIL'}
     
     blocks = []
     valid_matches = []
@@ -882,17 +1178,25 @@ def split_by_vin(text: str) -> List[str]:
         vin_value = (m.group(1) or m.group(2) or m.group(3))
         if vin_value:
             vin_upper = vin_value.upper().strip()
-            # Exclude common words
+            # SAFEGUARD: Exclude common words FIRST (before other checks)
             if vin_upper in excluded_words:
+                logger.debug(f"[split_by_vin] Rejected excluded word as VIN: {vin_upper}")
                 continue
             # Additional check: VINs should have at least one digit
             if not re.search(r'\d', vin_value):
+                logger.debug(f"[split_by_vin] Rejected VIN with no digits: {vin_value}")
                 continue
             # VINs should have at least 2 digits (to avoid false positives like "IDENTIFICATION")
             if len([c for c in vin_value if c.isdigit()]) < 2:
+                logger.debug(f"[split_by_vin] Rejected VIN with < 2 digits: {vin_value}")
+                continue
+            # SAFEGUARD: Additional length check - VINs should be 10-17 characters
+            if len(vin_value) < 10 or len(vin_value) > 17:
+                logger.debug(f"[split_by_vin] Rejected VIN with invalid length ({len(vin_value)}): {vin_value}")
                 continue
             # Skip if we've already seen this VIN (deduplicate)
             if vin_upper in seen_vins:
+                logger.debug(f"[split_by_vin] Rejected duplicate VIN: {vin_upper}")
                 continue
             seen_vins.add(vin_upper)
             valid_matches.append(m)
@@ -1093,14 +1397,58 @@ def extract_fields_from_block(text_block: str, mapping: Optional[Dict[str, Any]]
     # Debug: Log block being processed (suppressed in test output)
     logger.debug(f"[extract_fields_from_block] USING BLOCK: {text_block[:150]}")
     
+    # Enhanced debug for handwritten documents: print full block content
+    # This will help us understand if keywords are in blocks or lost during splitting
+    if source_type in ("pdf", "image") and len(text_block) > 50:
+        has_structured_labels = bool(re.search(r'\b(Make|Model|Year|Color|Mileage|Transmission|Fuel|Body)[:\s]', text_block, re.IGNORECASE))
+        if not has_structured_labels:
+            # Likely handwritten - print block for debugging (only for test VINs to avoid spam)
+            block_vin = None
+            vin_match = re.search(r'([A-HJ-NPR-Z0-9]{17})', text_block, re.IGNORECASE)
+            if vin_match:
+                block_vin = vin_match.group(1).upper()
+            
+            # Only debug for known test VINs
+            test_vins = ['HBUSRJGF4CBFPR9BN', 'HBU5RTGF4CBEPR9BN', 'HBUSRTGF4CBEPR9BN', 
+                        '3R5UAL4YUKPYGF1GZ', '3R5UAL4YUKPYGFIG7', 
+                        'ST420RJ98FDHKL4E', 'STLZ0RJ98FDHKL4HE']
+            if block_vin in test_vins:
+                print(f"\n[extract_fields_from_block DEBUG] HANDWRITTEN BLOCK for VIN {block_vin}:")
+                print(f"  Block length: {len(text_block)} chars")
+                print(f"  Full text: {repr(text_block[:500])}")  # First 500 chars
+                print(f"  Keyword checks:")
+                print(f"    - 'sedan': {'sedan' in text_block.lower()}")
+                print(f"    - 'truck': {'truck' in text_block.lower()}")
+                print(f"    - 'gas'/'gasoline': {bool(re.search(r'\b(gas|gasoline)\b', text_block.lower()))}")
+                print(f"    - 'automatic'/'auto': {bool(re.search(r'\b(automatic|auto)\b', text_block.lower()))}")
+                print(f"    - mileage pattern: {bool(re.search(r'\d+.*miles?', text_block, re.IGNORECASE))}")
+                print(f"    - '100245' or '100,245': {'100245' in text_block or '100,245' in text_block}")
+                print(f"    - '89000' or '89,000': {'89000' in text_block or '89,000' in text_block}")
+    
     # Initialize vehicle dict with all fields as None
     vehicle = {field: None for field in VEHICLE_SCHEMA_ORDER}
     
+    # Default _is_handwritten to False for all rows
+    vehicle["_is_handwritten"] = False
+    
+    # Detect handwriting: simple heuristic - check if text lacks structured PDF labels
+    # Handwritten documents typically don't have labels like "Make:", "Model:", "Year:", etc.
+    if source_type in ("pdf", "image"):
+        has_structured_labels = bool(re.search(r'\b(Make|Model|Year|Color|Mileage|Transmission|Fuel|Body)[:\s]', text_block, re.IGNORECASE))
+        # If no structured labels and text is substantial, likely handwritten
+        if not has_structured_labels and len(text_block) > 50:
+            vehicle["_is_handwritten"] = True
+    
     # Extract VIN from this block (must be present)
-    # Exclude common words that might match (including header tokens like "YEAR")
+    # SAFEGUARD: Exclude common words that might match (including header tokens like "YEAR")
+    # Expanded list to match split_by_vin() excluded words
     excluded_words = {'DEALERSHIP', 'IDENTIFICATION', 'TRANSMISSION', 'DESCRIPTION', 
                       'INFORMATION', 'REGISTRATION', 'DOCUMENTATION', 'SPECIFICATION',
-                      'YEAR', 'MAKE', 'MODEL', 'COLOR', 'MILEAGE', 'VIN'}
+                      'AUTOMATIC', 'MANUAL', 'YEAR', 'MAKE', 'MODEL', 'COLOR', 'MILEAGE', 
+                      'VIN', 'BODY_STYLE', 'FUEL_TYPE', 'OWNER_EMAIL', 'NOTES', 'VEHICLE_ID',
+                      'EFFECTIVE_DATE', 'TRIM', 'WEIGHT', 'BODY_TYPE', 'CURRENT_MILEAGE',
+                      'EXTERIOR_COLOR', 'FUEL', 'BODY', 'PAINTED', 'GASOLINE', 'TRANSMISSION',
+                      'CURRENT', 'EXTERIOR', 'ADDITIONAL', 'DETAIL', 'SHEET'}
     
     # VIN pattern: handle multiple formats
     # Pattern 1: Full "Vehicle Identification Number (VIN): X" format (PDF format) - HIGH PRIORITY
@@ -1143,8 +1491,25 @@ def extract_fields_from_block(text_block: str, mapping: Optional[Dict[str, Any]]
         
         # CRITICAL: Check excluded words FIRST (before length/digit checks)
         # This prevents header tokens like "YEAR", "MAKE", "MODEL" from being extracted as VINs
-        if vin in excluded_words:
+        # Also check case-insensitive match to catch variations
+        vin_upper = vin.upper().strip()
+        if vin in excluded_words or vin_upper in excluded_words:
             logger.debug(f"[extract_fields_from_block] VIN is excluded word: {vin}")
+            # #region agent log
+            with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
+                f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H8","location":"sources.py:1148","message":"VIN excluded word check","data":{"vin":vin,"excluded_words":list(excluded_words)[:5],"source_type":source_type},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
+            # #endregion
+            return None
+        
+        # Additional check: reject common header tokens that might slip through
+        # SAFEGUARD: Expanded list to catch all header tokens
+        common_header_tokens = {'YEAR', 'MAKE', 'MODEL', 'COLOR', 'MILEAGE', 'VIN', 'TRANSMISSION', 
+                                'BODY_STYLE', 'FUEL_TYPE', 'OWNER_EMAIL', 'NOTES', 'VEHICLE_ID',
+                                'EFFECTIVE_DATE', 'TRIM', 'WEIGHT', 'BODY_TYPE', 'CURRENT_MILEAGE',
+                                'EXTERIOR_COLOR', 'FUEL', 'AUTOMATIC', 'MANUAL', 'BODY', 'PAINTED',
+                                'GASOLINE', 'CURRENT', 'EXTERIOR', 'ADDITIONAL', 'DETAIL', 'SHEET'}
+        if vin_upper in common_header_tokens:
+            logger.debug(f"[extract_fields_from_block] VIN is header token: {vin}")
             return None
         
         if len(vin) < 10:
@@ -1169,25 +1534,35 @@ def extract_fields_from_block(text_block: str, mapping: Optional[Dict[str, Any]]
     
     # Extract year: 4-digit year pattern
     # PRESERVE invalid years (e.g., 1899) - warnings will be generated later
-    # Match any 4-digit year starting with 18, 19, 20, or 21
-    year_match = re.search(r'\b(1[89]\d{2}|20[0-3]\d|21[0-3]\d)\b', text_block)
-    if year_match:
+    # Try "Year: X" pattern first (common in PDFs)
+    year_label_match = re.search(r'Year[:\s]+(\d{4})', text_block, re.IGNORECASE)
+    if year_label_match:
         try:
-            vehicle['year'] = int(year_match.group(1))  # Preserve even if < 1990
+            vehicle['year'] = int(year_label_match.group(1))  # Preserve even if < 1990
         except ValueError:
             pass
-    else:
-        # Fallback: try to find any 4-digit number that might be a year
-        # This handles edge cases like handwritten years
-        year_fallback = re.search(r'\b(\d{4})\b', text_block)
-        if year_fallback:
+    
+    # If not found, try general year pattern
+    if not vehicle.get('year'):
+        # Match any 4-digit year starting with 18, 19, 20, or 21
+        year_match = re.search(r'\b(1[89]\d{2}|20[0-3]\d|21[0-3]\d)\b', text_block)
+        if year_match:
             try:
-                year_val = int(year_fallback.group(1))
-                # Only use if it's a reasonable year range (1800-2100)
-                if 1800 <= year_val <= 2100:
-                    vehicle['year'] = year_val  # Preserve even if invalid (warnings will be generated)
+                vehicle['year'] = int(year_match.group(1))  # Preserve even if < 1990
             except ValueError:
                 pass
+        else:
+            # Fallback: try to find any 4-digit number that might be a year
+            # This handles edge cases like handwritten years
+            year_fallback = re.search(r'\b(\d{4})\b', text_block)
+            if year_fallback:
+                try:
+                    year_val = int(year_fallback.group(1))
+                    # Only use if it's a reasonable year range (1800-2100)
+                    if 1800 <= year_val <= 2100:
+                        vehicle['year'] = year_val  # Preserve even if invalid (warnings will be generated)
+                except ValueError:
+                    pass
     
     # Extract make: Common makes in the block
     # Try patterns: "Make: Toyota", "Toyota Camry", "2024 Toyota"
@@ -1252,12 +1627,13 @@ def extract_fields_from_block(text_block: str, mapping: Optional[Dict[str, Any]]
     
     # Extract color: Common colors
     # Try "Color: X" or "Exterior Color: X" pattern first (common in PDFs)
-    color_label_match = re.search(r'(?:Exterior\s+)?Color:\s*([A-Z][a-z]+)', text_block, re.IGNORECASE)
+    # Allow for more flexible patterns - color might be after colon or space
+    color_label_match = re.search(r'(?:Exterior\s+)?Color[:\s]+([A-Z][a-z]+)', text_block, re.IGNORECASE)
     if color_label_match:
         vehicle['color'] = color_label_match.group(1).capitalize()
     else:
-        # Fallback: search for color words
-        colors = ['blue', 'red', 'white', 'black', 'silver', 'gray', 'grey', 'green', 'yellow']
+        # Fallback: search for color words (case-insensitive, whole word match)
+        colors = ['blue', 'red', 'white', 'black', 'silver', 'gray', 'grey', 'green', 'yellow', 'orange', 'purple', 'brown']
         text_lower = text_block.lower()
         for color in colors:
             if re.search(rf'\b{re.escape(color)}\b', text_lower):
@@ -1284,6 +1660,32 @@ def extract_fields_from_block(text_block: str, mapping: Optional[Dict[str, Any]]
             except ValueError:
                 pass
     
+    # Flexible keyword fallback for handwritten/natural language (only if still None)
+    # Apply only for handwritten PDF/image (no structured labels) or all image sources (PNG images)
+    # Look for patterns like "about X miles", "X miles on odometer", etc.
+    if vehicle.get('mileage') is None and source_type in ("pdf", "image"):
+        # Check if this is likely handwritten (no structured labels) or an image source
+        has_structured_labels = bool(re.search(r'\b(Make|Model|Year|Color|Mileage|Transmission|Fuel|Body)[:\s]', text_block, re.IGNORECASE))
+        is_likely_handwritten = not has_structured_labels and len(text_block) > 50
+        # Apply flexible patterns for handwritten docs or all image sources
+        if is_likely_handwritten or source_type == "image":
+            # More flexible patterns for natural language
+            mileage_patterns = [
+                r'about\s+([\d,]+)\s*(?:miles?|mi\.?)',  # "about 100,245 miles"
+                r'([\d,]+)\s*(?:miles?|mi\.?)\s+on\s+(?:the\s+)?odometer',  # "100,245 miles on odometer"
+                r'odometer[:\s]+([\d,]+)',  # "odometer: 100,245"
+                r'([\d,]+)\s*(?:miles?|mi\.?)\s+on\s+it',  # "100,245 miles on it"
+            ]
+            for pattern in mileage_patterns:
+                mileage_match = re.search(pattern, text_block, re.IGNORECASE)
+                if mileage_match:
+                    try:
+                        mileage_str = mileage_match.group(1).replace(',', '').replace(' ', '')
+                        vehicle['mileage'] = int(mileage_str)
+                        break
+                    except ValueError:
+                        continue
+    
     # Extract fuel_type: "Fuel Type: X" or "Fuel: X" pattern
     # Try "Fuel Type: X" first (common in PDFs)
     fuel_type_label_match = re.search(r'Fuel\s+Type:\s*([A-Z][a-z]+)', text_block, re.IGNORECASE)
@@ -1295,27 +1697,98 @@ def extract_fields_from_block(text_block: str, mapping: Optional[Dict[str, Any]]
         if fuel_match:
             vehicle['fuel_type'] = fuel_match.group(1).lower()
     
+    # Flexible keyword fallback for handwritten/natural language (only if still None)
+    # Apply only for handwritten PDF/image (no structured labels) or all image sources (PNG images)
+    if vehicle.get('fuel_type') is None and source_type in ("pdf", "image"):
+        # Check if this is likely handwritten (no structured labels) or an image source
+        has_structured_labels = bool(re.search(r'\b(Make|Model|Year|Color|Mileage|Transmission|Fuel|Body)[:\s]', text_block, re.IGNORECASE))
+        is_likely_handwritten = not has_structured_labels and len(text_block) > 50
+        # Apply flexible patterns for handwritten docs or all image sources
+        if is_likely_handwritten or source_type == "image":
+            text_lower = text_block.lower()
+            # Debug: Log what keywords we're searching for
+            if vehicle.get('vin') and vehicle.get('vin') in ['HBUSRJGF4CBFPR9BN', 'HBU5RTGF4CBEPR9BN', '3R5UAL4YUKPYGF1GZ', 'ST420RJ98FDHKL4E']:
+                logger.debug(f"[extract_fields_from_block] VIN {vehicle.get('vin')}: Searching for fuel_type keywords in block (length: {len(text_block)}, preview: {text_block[:200]})")
+            # Look for fuel type keywords anywhere in text (natural language)
+            if re.search(r'\b(gas|gasoline)\b', text_lower):
+                vehicle['fuel_type'] = 'gasoline'
+                if vehicle.get('vin') and vehicle.get('vin') in ['HBUSRJGF4CBFPR9BN', 'HBU5RTGF4CBEPR9BN', '3R5UAL4YUKPYGF1GZ', 'ST420RJ98FDHKL4E']:
+                    logger.debug(f"[extract_fields_from_block] VIN {vehicle.get('vin')}: Found fuel_type='gasoline' via keyword fallback")
+            elif re.search(r'\bdiesel\b', text_lower):
+                vehicle['fuel_type'] = 'diesel'
+            elif re.search(r'\belectric\b', text_lower):
+                vehicle['fuel_type'] = 'electric'
+            elif re.search(r'\bhybrid\b', text_lower):
+                vehicle['fuel_type'] = 'hybrid'
+            elif vehicle.get('vin') and vehicle.get('vin') in ['HBUSRJGF4CBFPR9BN', 'HBU5RTGF4CBEPR9BN', '3R5UAL4YUKPYGF1GZ', 'ST420RJ98FDHKL4E']:
+                logger.debug(f"[extract_fields_from_block] VIN {vehicle.get('vin')}: No fuel_type keywords found in block")
+    
     # Extract transmission: "Transmission: X" or "8-speed automatic" pattern
-    # Try "Transmission: X" first (common in PDFs)
-    trans_label_match = re.search(r'Transmission:\s*([A-Z][a-z]+)', text_block, re.IGNORECASE)
-    if trans_label_match:
-        trans_val = trans_label_match.group(1).lower()
-        if 'auto' in trans_val:
-            vehicle['transmission'] = 'automatic'
-        elif 'manual' in trans_val:
-            vehicle['transmission'] = 'manual'
-        else:
-            vehicle['transmission'] = trans_val
-    else:
-        # Fallback: "8-speed automatic" or "automatic" pattern
-        # Look for "transmission is described as an 8-speed auto" or similar
-        trans_match = re.search(r'transmission.*?(?:is\s+)?(?:described\s+as\s+)?(?:an?\s+)?(\d+[-\s]?speed\s+)?(automatic|manual|auto|AUTO)', text_block, re.IGNORECASE)
-        if trans_match:
-            trans_type = trans_match.group(2).lower() if trans_match.group(2) else None
-            if trans_type == 'auto':
+    # SAFEGUARD: Try fallback pattern FIRST (handles "transmission is described as" better)
+    # Then try label pattern, but capture multi-word values
+    transmission_extracted = False
+    
+    # Pattern 1: "transmission is described as an 8-speed auto" or similar (HIGH PRIORITY)
+    trans_match = re.search(r'transmission.*?(?:is\s+)?(?:described\s+as\s+)?(?:an?\s+)?(\d+[-\s]?speed\s+)?(automatic|manual|auto|AUTO)', text_block, re.IGNORECASE)
+    if trans_match:
+        trans_type = trans_match.group(2).lower() if trans_match.group(2) else None
+        if trans_type:
+            if trans_type == 'auto' or trans_type == 'AUTO':
                 vehicle['transmission'] = 'automatic'
             else:
                 vehicle['transmission'] = trans_type
+            transmission_extracted = True
+    
+    # Pattern 2: "Transmission: X" - capture multi-word values (not just first word)
+    if not transmission_extracted:
+        # Capture everything after "Transmission:" until newline, comma, or period
+        trans_label_match = re.search(r'Transmission[:\s]+([^\n,\.]+)', text_block, re.IGNORECASE)
+        if trans_label_match:
+            trans_val_raw = trans_label_match.group(1).strip()
+            # Clean up filler words using cleanup_vision_value
+            trans_val_cleaned = cleanup_vision_value(trans_val_raw)
+            if trans_val_cleaned:
+                trans_val = trans_val_cleaned.lower()
+                if 'auto' in trans_val or trans_val.upper() == 'AUTO':
+                    vehicle['transmission'] = 'automatic'
+                elif 'manual' in trans_val:
+                    vehicle['transmission'] = 'manual'
+                elif 'cvt' in trans_val:
+                    vehicle['transmission'] = 'cvt'
+                else:
+                    # If cleaned value is just a filler word, try to extract from original
+                    # Look for transmission type keywords in the original value
+                    if 'automatic' in trans_val_raw.lower() or 'auto' in trans_val_raw.lower():
+                        vehicle['transmission'] = 'automatic'
+                    elif 'manual' in trans_val_raw.lower():
+                        vehicle['transmission'] = 'manual'
+                    else:
+                        # Last resort: use cleaned value (will trigger unknown_transmission warning)
+                        vehicle['transmission'] = trans_val_cleaned
+    
+    # Flexible keyword fallback for handwritten/natural language (only if still None)
+    # Apply only for handwritten PDF/image (no structured labels) or all image sources (PNG images)
+    if vehicle.get('transmission') is None and source_type in ("pdf", "image"):
+        # Check if this is likely handwritten (no structured labels) or an image source
+        has_structured_labels = bool(re.search(r'\b(Make|Model|Year|Color|Mileage|Transmission|Fuel|Body)[:\s]', text_block, re.IGNORECASE))
+        is_likely_handwritten = not has_structured_labels and len(text_block) > 50
+        # Apply flexible patterns for handwritten docs or all image sources
+        if is_likely_handwritten or source_type == "image":
+            text_lower = text_block.lower()
+            # Debug: Log what keywords we're searching for
+            if vehicle.get('vin') and vehicle.get('vin') in ['HBUSRJGF4CBFPR9BN', 'HBU5RTGF4CBEPR9BN', '3R5UAL4YUKPYGF1GZ', 'ST420RJ98FDHKL4E']:
+                logger.debug(f"[extract_fields_from_block] VIN {vehicle.get('vin')}: Searching for transmission keywords in block")
+            # Look for transmission keywords anywhere in text (natural language)
+            if re.search(r'\b(automatic|auto)\b', text_lower):
+                vehicle['transmission'] = 'automatic'
+                if vehicle.get('vin') and vehicle.get('vin') in ['HBUSRJGF4CBFPR9BN', 'HBU5RTGF4CBEPR9BN', '3R5UAL4YUKPYGF1GZ', 'ST420RJ98FDHKL4E']:
+                    logger.debug(f"[extract_fields_from_block] VIN {vehicle.get('vin')}: Found transmission='automatic' via keyword fallback")
+            elif re.search(r'\bmanual\b', text_lower):
+                vehicle['transmission'] = 'manual'
+            elif re.search(r'\bcvt\b', text_lower):
+                vehicle['transmission'] = 'cvt'
+            elif vehicle.get('vin') and vehicle.get('vin') in ['HBUSRJGF4CBFPR9BN', 'HBU5RTGF4CBEPR9BN', '3R5UAL4YUKPYGF1GZ', 'ST420RJ98FDHKL4E']:
+                logger.debug(f"[extract_fields_from_block] VIN {vehicle.get('vin')}: No transmission keywords found in block")
     
     # Extract owner_email: "Owner Email: X" or email pattern
     # PRESERVE invalid email formats - warnings will be generated later
@@ -1349,6 +1822,8 @@ def extract_fields_from_block(text_block: str, mapping: Optional[Dict[str, Any]]
                 vehicle['body_style'] = style
                 break
     
+    # Note: body_style already has flexible keyword fallback above, so no additional fallback needed
+    
     # Extract notes: PDF uses new pattern, everything else leaves notes empty
     if source_type == "pdf":
         notes_match = re.search(
@@ -1369,6 +1844,34 @@ def extract_fields_from_block(text_block: str, mapping: Optional[Dict[str, Any]]
     # Generate human-readable notes from extracted fields (if notes not already set)
     if not vehicle.get('notes'):
         vehicle['notes'] = _generate_vehicle_notes(vehicle)
+    
+    # SAFEGUARD: Clean up all extracted string values using cleanup_vision_value
+    # This removes filler words like "is", "described", "was" that might have been extracted
+    for field_name, field_value in vehicle.items():
+        if isinstance(field_value, str) and field_value:
+            cleaned_value = cleanup_vision_value(field_value)
+            if cleaned_value is not None:
+                vehicle[field_name] = cleaned_value
+            elif cleaned_value is None and field_value:
+                # If cleanup returned None, it means value was just filler words
+                # For critical fields, try to preserve original if it's not just filler
+                if field_name in ['transmission', 'color', 'make', 'model', 'body_style', 'fuel_type']:
+                    # Keep original value - normalization will handle it
+                    pass
+                else:
+                    vehicle[field_name] = None
+    
+    # SAFEGUARD: Field preservation validation - log if critical fields are missing
+    critical_fields = ['vin', 'year', 'make', 'model']
+    missing_critical = [f for f in critical_fields if not vehicle.get(f)]
+    if missing_critical and vehicle.get('vin'):
+        logger.debug(f"[extract_fields_from_block] WARNING: Missing critical fields for VIN {vehicle.get('vin')}: {missing_critical}")
+    
+    # #region agent log
+    if vehicle.get('vin') == 'ST420RJ98FDHKL4E':
+        with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
+            f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H1","location":"sources.py:1371","message":"PDF Row 6 extraction complete","data":{"vin":vehicle.get('vin'),"year":vehicle.get('year'),"make":vehicle.get('make'),"model":vehicle.get('model'),"color":vehicle.get('color'),"owner_email":vehicle.get('owner_email'),"transmission":vehicle.get('transmission'),"source_type":source_type},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
+    # #endregion
     
     return vehicle
 
@@ -1749,6 +2252,11 @@ def parse_vehicle_raw_text(text: str, source_type: str = "raw") -> List[Dict[str
     
     for i, b in enumerate(blocks):
         logger.debug(f"[parse_vehicle_raw_text] Processing block {i+1}/{len(blocks)}")
+        # #region agent log
+        if 'ST420RJ98FDHKL4E' in b.upper():
+            with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
+                f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H1","location":"sources.py:1760","message":"PDF Row 6: Block text before extraction","data":{"block_index":i,"block_length":len(b),"block_preview":b[:500],"has_year":'year' in b.lower() or '1899' in b,"has_make":'make' in b.lower() or 'nissan' in b.lower(),"has_model":'model' in b.lower() or 'altima' in b.lower(),"has_color":'color' in b.lower() or 'green' in b.lower(),"has_email":'email' in b.lower() or 'bad-email' in b.lower(),"has_transmission":'transmission' in b.lower() or 'automatic' in b.lower()},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
+        # #endregion
         vehicle = extract_fields_from_block(b, mapping=None, source_type=source_type)
         if vehicle and vehicle.get('vin'):
             vin_upper = vehicle.get('vin').upper()
@@ -1763,6 +2271,13 @@ def parse_vehicle_raw_text(text: str, source_type: str = "raw") -> List[Dict[str
             logger.debug(f"[parse_vehicle_raw_text] Block {i+1}: no vehicle extracted")
     
     logger.info(f"[parse_vehicle_raw_text] Total vehicles extracted: {len(vehicles)} (after deduplication)")
+    
+    # SAFEGUARD: Section counting validation - warn if we found fewer vehicles than expected
+    # Expected count is based on number of blocks found by split_by_vin
+    if len(vehicles) < len(blocks):
+        missing_count = len(blocks) - len(vehicles)
+        logger.warning(f"[parse_vehicle_raw_text] WARNING: Found {len(blocks)} VIN blocks but only extracted {len(vehicles)} vehicles. {missing_count} block(s) failed extraction.")
+    
     return vehicles
 
 
@@ -3209,7 +3724,11 @@ def _extract_table_with_vision_api(
     openai_key = os.getenv("OPENAI_API_KEY")
     if not openai_key:
         logger.warning("[Vision] OPENAI_API_KEY missing - checked current dir and project root")
-        return None
+        # Return empty 2D array with headers to ensure normalize_v2 is called
+        from schema import VEHICLE_SCHEMA_ORDER
+        canonical_schema = VEHICLE_SCHEMA_ORDER.copy()
+        header_row = list(canonical_schema) + ["_is_handwritten"]
+        return [header_row]  # Return header row only, no data rows
     logger.info("[Vision] API key found")
     
     # Use appropriate model based on source type: PDF_MODEL for PDFs, IMAGE_MODEL for images
@@ -3232,7 +3751,11 @@ def _extract_table_with_vision_api(
         logger.info("[Vision] OpenAI client initialized")
     except Exception as e:
         logger.error(f"[Vision] Client init error: {e}")
-        return None
+        # Return empty 2D array with headers to ensure normalize_v2 is called
+        from schema import VEHICLE_SCHEMA_ORDER
+        canonical_schema = VEHICLE_SCHEMA_ORDER.copy()
+        header_row = list(canonical_schema) + ["_is_handwritten"]
+        return [header_row]  # Return header row only, no data rows
     
     # Concatenate OCR text blocks if provided
     ocr_text = ""
@@ -3247,7 +3770,9 @@ def _extract_table_with_vision_api(
     # Get PDF page count and organize OCR text blocks by page
     page_count = 1
     page_text_blocks_dict = {}  # page_num -> list of text blocks
-    if source_type == SourceType.PDF:
+    # Check if file is actually a PDF (even if source_type is IMAGE - for scanned PDFs)
+    is_actually_pdf = file_path.suffix.lower() == '.pdf'
+    if source_type == SourceType.PDF or (source_type == SourceType.IMAGE and is_actually_pdf):
         print("PDF PROMPT ACTIVE")  # Debug print to verify PDF extraction path
         try:
             import PyPDF2
@@ -3278,29 +3803,74 @@ def _extract_table_with_vision_api(
         elif page_text_blocks:
             # Use provided page_text_blocks
             page_text_blocks_dict = page_text_blocks
+        else:
+            # No page_text_blocks provided - extract OCR text from PDF pages
+            # This is needed when _extract_table_with_vision_api is called directly
+            if source_type == SourceType.PDF:
+                try:
+                    from ocr.reader import extract_text_from_pdf
+                    ocr_text_blocks, _ = extract_text_from_pdf(file_path, enable_vision=False, **kwargs)
+                    if ocr_text_blocks:
+                        # Organize blocks by page (assume all blocks are from page 1 if no page info)
+                        page_text_blocks_dict[1] = ocr_text_blocks
+                        logger.info(f"[Vision] Extracted {len(ocr_text_blocks)} OCR text blocks from PDF")
+                except Exception as e:
+                    logger.debug(f"[Vision] Could not extract OCR text from PDF: {e}")
     
     # Convert PDF/Image/Raw Text to images (all pages) if needed
     images = []
     try:
-        if source_type == SourceType.PDF:
+        # Check if file is actually a PDF (even if source_type is IMAGE - for scanned PDFs)
+        is_actually_pdf = file_path.suffix.lower() == '.pdf'
+        
+        if source_type == SourceType.PDF or (source_type == SourceType.IMAGE and is_actually_pdf):
+            # PDF file: convert pages to images
             try:
                 from pdf2image import convert_from_path
                 images = convert_from_path(str(file_path), first_page=1, last_page=page_count)
                 if not images:
                     logger.warning("[Vision] Could not convert PDF to images")
-                    return None
-                logger.debug(f"[Vision] PDF converted to {len(images)} images")
+                    # Return empty 2D array with headers to ensure normalize_v2 is called
+                    from schema import VEHICLE_SCHEMA_ORDER
+                    canonical_schema = VEHICLE_SCHEMA_ORDER.copy()
+                    header_row = list(canonical_schema) + ["_is_handwritten"]
+                    return [header_row]  # Return header row only, no data rows
+                logger.debug(f"[Vision] PDF converted to {len(images)} images (routed as {'IMAGE' if source_type == SourceType.IMAGE else 'PDF'})")
             except ImportError:
                 logger.error("[Vision] pdf2image not installed, cannot process PDF")
-                return None
+                # Return empty 2D array with headers to ensure normalize_v2 is called
+                from schema import VEHICLE_SCHEMA_ORDER
+                canonical_schema = VEHICLE_SCHEMA_ORDER.copy()
+                header_row = list(canonical_schema) + ["_is_handwritten"]
+                return [header_row]  # Return header row only, no data rows
             except Exception as e:
                 logger.error(f"[Vision] Error converting PDF to images: {e}")
-                return None
+                # Return empty 2D array with headers to ensure normalize_v2 is called
+                from schema import VEHICLE_SCHEMA_ORDER
+                canonical_schema = VEHICLE_SCHEMA_ORDER.copy()
+                header_row = list(canonical_schema) + ["_is_handwritten"]
+                return [header_row]  # Return header row only, no data rows
         elif source_type == SourceType.IMAGE:
             # For images, process as single page
-            images = [Image.open(file_path)]
-            page_count = 1
-            logger.debug("[Vision] Image opened")
+            try:
+                from PIL import Image
+                images = [Image.open(file_path)]
+                page_count = 1
+                logger.debug("[Vision] Image opened")
+            except ImportError:
+                logger.error("[Vision] PIL/Pillow not installed - cannot process images")
+                # Return empty 2D array with headers to ensure normalize_v2 is called
+                from schema import VEHICLE_SCHEMA_ORDER
+                canonical_schema = VEHICLE_SCHEMA_ORDER.copy()
+                header_row = list(canonical_schema) + ["_is_handwritten"]
+                return [header_row]  # Return header row only, no data rows
+            except Exception as e:
+                logger.error(f"[Vision] Error opening image: {e}")
+                # Return empty 2D array with headers to ensure normalize_v2 is called
+                from schema import VEHICLE_SCHEMA_ORDER
+                canonical_schema = VEHICLE_SCHEMA_ORDER.copy()
+                header_row = list(canonical_schema) + ["_is_handwritten"]
+                return [header_row]  # Return header row only, no data rows
         elif source_type == SourceType.RAW_TEXT:
             # For raw text, read the file and process text content directly
             try:
@@ -3312,10 +3882,18 @@ def _extract_table_with_vision_api(
                 page_count = 1
             except Exception as e:
                 logger.error(f"[Vision] Error reading raw text file: {e}")
-                return None
+                # Return empty 2D array with headers to ensure normalize_v2 is called
+                from schema import VEHICLE_SCHEMA_ORDER
+                canonical_schema = VEHICLE_SCHEMA_ORDER.copy()
+                header_row = list(canonical_schema) + ["_is_handwritten"]
+                return [header_row]  # Return header row only, no data rows
         else:
             logger.error(f"[Vision] Unsupported source type: {source_type}")
-            return None
+            # Return empty 2D array with headers to ensure normalize_v2 is called
+            from schema import VEHICLE_SCHEMA_ORDER
+            canonical_schema = VEHICLE_SCHEMA_ORDER.copy()
+            header_row = list(canonical_schema) + ["_is_handwritten"]
+            return [header_row]  # Return header row only, no data rows
         
         # Load mapping config based on source type
         from mappings import get_mapping_by_id
@@ -3356,6 +3934,34 @@ def _extract_table_with_vision_api(
             
             # Build system prompt with field-specific instructions
             system_prompt = (
+                "CRITICAL EXTRACTION RULES (HIGHEST PRIORITY):\n"
+                "\n"
+                "You must attempt to extract EVERY canonical vehicle field for EACH vehicle,\n"
+                "even if the value must be inferred from natural language.\n"
+                "\n"
+                "For each vehicle:\n"
+                "- If a field is not explicitly labeled, infer it from context.\n"
+                "- If inference is uncertain, return your best guess.\n"
+                "- If no reasonable inference is possible, return null — NEVER omit the field.\n"
+                "\n"
+                "Inference examples (MANDATORY):\n"
+                "- If text contains \"sedan\", body_style = \"sedan\"\n"
+                "- If text contains \"truck\" or \"pickup\", body_style = \"truck\"\n"
+                "- If text contains \"gas\", \"gasoline\", fuel_type = \"gasoline\"\n"
+                "- If text contains \"automatic\", \"auto\", \"8-speed auto\", transmission = \"automatic\"\n"
+                "- If text contains an email-like string, extract it as owner_email\n"
+                "\n"
+                "This rule applies to:\n"
+                "- PDFs\n"
+                "- Handwritten documents\n"
+                "- Images\n"
+                "- Tables\n"
+                "- Free-form notes\n"
+                "\n"
+                "Failure to infer a field when the information is visible is an error.\n"
+                "\n"
+                "---\n"
+                "\n"
                 "You are an OCR engine that extracts vehicle data from an image or PDF. "
                 "You MUST identify EVERY individual vehicle described in the document. "
                 "Return ONLY valid JSON, no explanations, no markdown, no additional text. "
@@ -3379,21 +3985,93 @@ def _extract_table_with_vision_api(
                 "- Do NOT add markdown code blocks (```json)\n"
                 "- Do NOT add comments or descriptions\n"
                 "\n"
+                "SECTION-BASED SEPARATION (CRITICAL FOR HANDWRITTEN DOCUMENTS):\n"
+                "- Documents may contain multiple vehicles organized in SECTIONS or BLOCKS\n"
+                "- Each section/block represents ONE complete vehicle record\n"
+                "- CRITICAL: Handwritten documents are typically NOT in table format - they are organized as SEPARATE TEXT BLOCKS\n"
+                "- Each vehicle's information is written in its own distinct block/section, NOT in table rows\n"
+                "- Look for visual separators: blank lines, horizontal lines, boxes, borders, or distinct sections\n"
+                "- For handwritten documents: each vehicle is typically in its own separate block with all its information grouped together\n"
+                "- Identify block/section boundaries by:\n"
+                "  * Blank lines or spacing between vehicle information\n"
+                "  * Visual dividers (lines, boxes, borders)\n"
+                "  * Each VIN typically starts a new block\n"
+                "  * All fields for one vehicle are grouped within the same block\n"
+                "  * Each block is a self-contained paragraph or section of text describing one vehicle\n"
+                "- DO NOT mix fields from different blocks - each block = one vehicle = one row\n"
+                "- If you see multiple distinct blocks/sections of information, each is a separate vehicle\n"
+                "- For handwritten documents: carefully identify where one vehicle block ends and the next begins\n"
+                "- Extract ONE row per block/section, even if blocks are not perfectly aligned or formatted\n"
+                "- If a document has 3 blocks with vehicle info, you MUST extract 3 rows (one per block)\n"
+                "- IMPORTANT: Do NOT look for table structure in handwritten documents - look for separate text blocks instead\n"
+                "\n"
+            )
+            
+            # Add IMAGE TYPE DETECTION section only for IMAGE sources
+            if source_type == SourceType.IMAGE:
+                system_prompt += (
+                    "IMAGE TYPE DETECTION:\n"
+                    "- First, determine if the image is a TABLE or a DOCUMENT-STYLE layout\n"
+                    "- TABLE: Has clear column headers like YEAR, MAKE, MODEL, VIN, COLOR, MILEAGE arranged in columns\n"
+                    "- DOCUMENT-STYLE: Information is organized in sections/blocks, not in a structured table format\n"
+                    "\n"
+                    "- If the image is a TABLE (column headers like YEAR, MAKE, MODEL, VIN):\n"
+                    "  * CRITICAL: The FIRST ROW is ALWAYS the header row - DO NOT extract it as a vehicle\n"
+                    "  * Before extracting, identify which row is the header row (contains 'YEAR', 'MAKE', 'MODEL', 'VIN', 'COLOR', 'MILEAGE', etc.)\n"
+                    "  * Skip the header row completely - do NOT include it in your output\n"
+                    "  * Extract ONLY data rows that contain a VALID 17-character VIN in the VIN column\n"
+                    "  * NEVER treat header rows as vehicles - skip any row where the VIN column contains 'YEAR', 'MAKE', 'MODEL', 'VIN', 'COLOR', 'MILEAGE', 'NOTES', 'BODY', 'PAINTED', 'GASOLINE', 'TRANSMISSION', etc.\n"
+                    "  * If the VIN column contains ANY header text (even partial matches), SKIP that entire row\n"
+                    "  * If no valid VIN exists in a row, SKIP it entirely - do NOT extract it\n"
+                    "  * A valid VIN must have at least 2 digits and be 10-17 characters long\n"
+                    "  * Only extract rows with valid 17-character alphanumeric VINs (excluding I, O, Q)\n"
+                    "  * Each valid VIN row = one vehicle = one output row\n"
+                    "  * If you see a table with headers, count the header row and skip it - only extract data rows below it\n"
+                    "  * CRITICAL FOR TABLE EXTRACTION: Read EACH COLUMN for EACH data row:\n"
+                    "    - For each data row, read the value in EVERY column (YEAR, MAKE, MODEL, VIN, COLOR, MILEAGE, BODY, FUEL, TRANSMISSION, EMAIL, NOTES, etc.)\n"
+                    "    - Extract the value from each column cell - do NOT skip columns even if they seem empty or contain unusual values\n"
+                    "    - Map each column header to the corresponding field in the output schema\n"
+                    "    - If a column cell is empty or unclear, use null (not empty string)\n"
+                    "    - Extract ALL visible columns for each row - do NOT omit any columns\n"
+                    "\n"
+                    "- If the image is NOT a table (document-style or handwritten):\n"
+                    "  * Use section-based extraction rules (see SECTION-BASED SEPARATION above)\n"
+                    "  * Identify distinct sections/blocks of vehicle information\n"
+                    "  * CRITICAL: Handwritten images are typically organized as SEPARATE TEXT BLOCKS, NOT tables\n"
+                    "  * Each block is a self-contained paragraph or section describing one vehicle\n"
+                    "  * Extract one row per block, even if formatting is irregular\n"
+                    "  * Each block should contain a VIN and associated vehicle fields\n"
+                    "  * Do NOT look for table structure - look for separate text blocks instead\n"
+                    "\n"
+                )
+            
+            system_prompt += (
+                "VIN VALIDATION (CRITICAL):\n"
+                "- The VIN (first field) MUST be a valid 17-character alphanumeric code\n"
+                "- VIN must contain at least 2 digits and exclude letters I, O, Q\n"
+                "- DO NOT include header rows - if the VIN column contains text like 'YEAR', 'MAKE', 'MODEL', 'VIN', 'COLOR', 'MILEAGE', skip that row entirely\n"
+                "- DO NOT include table headers as data rows - only extract rows with valid vehicle VINs\n"
+                "- For handwritten documents, carefully validate VINs to avoid OCR character recognition errors (e.g., '0' vs 'O', '1' vs 'I')\n"
+                "- Each valid VIN you find represents a separate vehicle - extract it as a separate row\n"
+                "\n"
                 "EXTRACTION RULES (CRITICAL):\n"
                 "- Extract values EXACTLY as written in the source document\n"
                 "- Do NOT reword, summarize, paraphrase, or embellish any values\n"
                 "- Do NOT normalize or convert values (preserve original format)\n"
-                "- Do NOT infer missing values - use null if not present\n"
+                "- Infer missing values from natural language when possible (see CRITICAL EXTRACTION RULES at top) - only use null if no reasonable inference is possible\n"
                 "- When uncertain, extract your best guess rather than omitting the field\n"
-                "- For invalid values (e.g., year=1899, mileage=-100), extract them anyway - validation will handle warnings\n"
+                "- For invalid values (e.g., year=1899, mileage=-100, invalid email), extract them anyway - validation will handle warnings\n"
                 "- Prefer extraction over omission - always attempt to extract a value if it appears in the document\n"
+                "- Extract ALL fields for each vehicle - do NOT skip fields even if they seem invalid or unusual\n"
+                "- For each vehicle, attempt to extract: VIN, year, make, model, color, mileage, body_style, fuel_type, transmission, owner_email, and notes\n"
+                "- When extracting from a section: extract ALL fields that appear in that section, even if formatting is irregular\n"
                 "\n"
                 "NOTES FIELD RULES (CRITICAL):\n"
                 "- If notes exist in the source, copy them VERBATIM - word-for-word, character-for-character\n"
                 "- Preserve original wording, punctuation, sentence order, and capitalization\n"
                 "- Do NOT summarize, paraphrase, rewrite, or reorder sentences\n"
                 "- Do NOT remove content unless it's clearly not vehicle-specific\n"
-                "- Do NOT add explanatory text or infer missing information\n"
+                "- Do NOT add explanatory text or fabricate information that is not visible in the document\n"
                 "- If no notes are present in the source, set notes = null (not empty string)\n"
                 "- If notes contain bullets or list markers, preserve them as written\n"
                 "\n"
@@ -3413,6 +4091,34 @@ def _extract_table_with_vision_api(
         else:
             # Fallback to basic prompt if mapping not found
             system_prompt = (
+                "CRITICAL EXTRACTION RULES (HIGHEST PRIORITY):\n"
+                "\n"
+                "You must attempt to extract EVERY canonical vehicle field for EACH vehicle,\n"
+                "even if the value must be inferred from natural language.\n"
+                "\n"
+                "For each vehicle:\n"
+                "- If a field is not explicitly labeled, infer it from context.\n"
+                "- If inference is uncertain, return your best guess.\n"
+                "- If no reasonable inference is possible, return null — NEVER omit the field.\n"
+                "\n"
+                "Inference examples (MANDATORY):\n"
+                "- If text contains \"sedan\", body_style = \"sedan\"\n"
+                "- If text contains \"truck\" or \"pickup\", body_style = \"truck\"\n"
+                "- If text contains \"gas\", \"gasoline\", fuel_type = \"gasoline\"\n"
+                "- If text contains \"automatic\", \"auto\", \"8-speed auto\", transmission = \"automatic\"\n"
+                "- If text contains an email-like string, extract it as owner_email\n"
+                "\n"
+                "This rule applies to:\n"
+                "- PDFs\n"
+                "- Handwritten documents\n"
+                "- Images\n"
+                "- Tables\n"
+                "- Free-form notes\n"
+                "\n"
+                "Failure to infer a field when the information is visible is an error.\n"
+                "\n"
+                "---\n"
+                "\n"
                 "You are an OCR engine that extracts vehicle data from an image or PDF. "
                 "You MUST identify EVERY individual vehicle described in the document. "
                 "Return ONLY valid JSON, no explanations, no markdown, no additional text. "
@@ -3433,21 +4139,89 @@ def _extract_table_with_vision_api(
                 f"- Each row must have exactly {len(canonical_schema)} values matching the {len(canonical_schema)} headers\n"
                 "- Output ONLY the JSON object - no explanatory text before or after\n"
                 "\n"
+                "SECTION-BASED SEPARATION (CRITICAL FOR HANDWRITTEN DOCUMENTS):\n"
+                "- Documents may contain multiple vehicles organized in SECTIONS or BLOCKS\n"
+                "- Each section/block represents ONE complete vehicle record\n"
+                "- Look for visual separators: blank lines, horizontal lines, boxes, borders, or distinct sections\n"
+                "- For handwritten documents: each vehicle is typically in its own section with all its information grouped together\n"
+                "- Identify section boundaries by:\n"
+                "  * Blank lines or spacing between vehicle information\n"
+                "  * Visual dividers (lines, boxes, borders)\n"
+                "  * Each VIN typically starts a new section\n"
+                "  * All fields for one vehicle are grouped within the same section\n"
+                "- DO NOT mix fields from different sections - each section = one vehicle = one row\n"
+                "- If you see multiple distinct sections/blocks of information, each is a separate vehicle\n"
+                "- For handwritten documents: carefully identify where one vehicle section ends and the next begins\n"
+                "- Extract ONE row per section/block, even if sections are not perfectly aligned or formatted\n"
+                "- If a document has 3 sections with vehicle info, you MUST extract 3 rows (one per section)\n"
+                "\n"
+            )
+            
+            # Add IMAGE TYPE DETECTION section only for IMAGE sources (fallback prompt)
+            if source_type == SourceType.IMAGE:
+                system_prompt += (
+                    "IMAGE TYPE DETECTION:\n"
+                    "- First, determine if the image is a TABLE or a DOCUMENT-STYLE layout\n"
+                    "- TABLE: Has clear column headers like YEAR, MAKE, MODEL, VIN, COLOR, MILEAGE arranged in columns\n"
+                    "- DOCUMENT-STYLE: Information is organized in sections/blocks, not in a structured table format\n"
+                    "\n"
+                    "- If the image is a TABLE (column headers like YEAR, MAKE, MODEL, VIN):\n"
+                    "  * CRITICAL: The FIRST ROW is ALWAYS the header row - DO NOT extract it as a vehicle\n"
+                    "  * Before extracting, identify which row is the header row (contains 'YEAR', 'MAKE', 'MODEL', 'VIN', 'COLOR', 'MILEAGE', etc.)\n"
+                    "  * Skip the header row completely - do NOT include it in your output\n"
+                    "  * Extract ONLY data rows that contain a VALID 17-character VIN in the VIN column\n"
+                    "  * NEVER treat header rows as vehicles - skip any row where the VIN column contains 'YEAR', 'MAKE', 'MODEL', 'VIN', 'COLOR', 'MILEAGE', 'NOTES', 'BODY', 'PAINTED', 'GASOLINE', 'TRANSMISSION', etc.\n"
+                    "  * If the VIN column contains ANY header text (even partial matches), SKIP that entire row\n"
+                    "  * If no valid VIN exists in a row, SKIP it entirely - do NOT extract it\n"
+                    "  * A valid VIN must have at least 2 digits and be 10-17 characters long\n"
+                    "  * Only extract rows with valid 17-character alphanumeric VINs (excluding I, O, Q)\n"
+                    "  * Each valid VIN row = one vehicle = one output row\n"
+                    "  * If you see a table with headers, count the header row and skip it - only extract data rows below it\n"
+                    "  * CRITICAL FOR TABLE EXTRACTION: Read EACH COLUMN for EACH data row:\n"
+                    "    - For each data row, read the value in EVERY column (YEAR, MAKE, MODEL, VIN, COLOR, MILEAGE, BODY, FUEL, TRANSMISSION, EMAIL, NOTES, etc.)\n"
+                    "    - Extract the value from each column cell - do NOT skip columns even if they seem empty or contain unusual values\n"
+                    "    - Map each column header to the corresponding field in the output schema\n"
+                    "    - If a column cell is empty or unclear, use null (not empty string)\n"
+                    "    - Extract ALL visible columns for each row - do NOT omit any columns\n"
+                    "\n"
+                    "- If the image is NOT a table (document-style or handwritten):\n"
+                    "  * Use section-based extraction rules (see SECTION-BASED SEPARATION above)\n"
+                    "  * Identify distinct sections/blocks of vehicle information\n"
+                    "  * CRITICAL: Handwritten images are typically organized as SEPARATE TEXT BLOCKS, NOT tables\n"
+                    "  * Each block is a self-contained paragraph or section describing one vehicle\n"
+                    "  * Extract one row per block, even if formatting is irregular\n"
+                    "  * Each block should contain a VIN and associated vehicle fields\n"
+                    "  * Do NOT look for table structure - look for separate text blocks instead\n"
+                    "\n"
+                )
+            
+            system_prompt += (
+                "VIN VALIDATION (CRITICAL):\n"
+                "- The VIN (first field) MUST be a valid 17-character alphanumeric code\n"
+                "- VIN must contain at least 2 digits and exclude letters I, O, Q\n"
+                "- DO NOT include header rows - if the VIN column contains text like 'YEAR', 'MAKE', 'MODEL', 'VIN', 'COLOR', 'MILEAGE', skip that row entirely\n"
+                "- DO NOT include table headers as data rows - only extract rows with valid vehicle VINs\n"
+                "- For handwritten documents, carefully validate VINs to avoid OCR character recognition errors (e.g., '0' vs 'O', '1' vs 'I')\n"
+                "- Each valid VIN you find represents a separate vehicle - extract it as a separate row\n"
+                "\n"
                 "EXTRACTION RULES (CRITICAL):\n"
                 "- Extract values EXACTLY as written in the source document\n"
                 "- Do NOT reword, summarize, paraphrase, or embellish any values\n"
                 "- Do NOT normalize or convert values (preserve original format)\n"
-                "- Do NOT infer missing values - use null if not present\n"
+                "- Infer missing values from natural language when possible (see CRITICAL EXTRACTION RULES at top) - only use null if no reasonable inference is possible\n"
                 "- When uncertain, extract your best guess rather than omitting the field\n"
-                "- For invalid values (e.g., year=1899, mileage=-100), extract them anyway - validation will handle warnings\n"
+                "- For invalid values (e.g., year=1899, mileage=-100, invalid email), extract them anyway - validation will handle warnings\n"
                 "- Prefer extraction over omission - always attempt to extract a value if it appears in the document\n"
+                "- Extract ALL fields for each vehicle - do NOT skip fields even if they seem invalid or unusual\n"
+                "- For each vehicle, attempt to extract: VIN, year, make, model, color, mileage, body_style, fuel_type, transmission, owner_email, and notes\n"
+                "- When extracting from a section: extract ALL fields that appear in that section, even if formatting is irregular\n"
                 "\n"
                 "NOTES FIELD RULES (CRITICAL):\n"
                 "- If notes exist in the source, copy them VERBATIM - word-for-word, character-for-character\n"
                 "- Preserve original wording, punctuation, sentence order, and capitalization\n"
                 "- Do NOT summarize, paraphrase, rewrite, or reorder sentences\n"
                 "- Do NOT remove content unless it's clearly not vehicle-specific\n"
-                "- Do NOT add explanatory text or infer missing information\n"
+                "- Do NOT add explanatory text or fabricate information that is not visible in the document\n"
                 "- If no notes are present in the source, set notes = null (not empty string)\n"
             )
         
@@ -3587,7 +4361,9 @@ def _extract_table_with_vision_api(
                     logger.info(f"[Raw Text] Extracted {len(vehicles)} vehicle(s) from raw text")
                     
                     # Convert to 2D array format matching canonical schema
-                    rows_2d = [canonical_schema]  # Header row
+                    # Include _is_handwritten and _is_vision_extracted in header to preserve them through rows2d_to_objects
+                    header_row = list(canonical_schema) + ["_is_handwritten", "_is_vision_extracted"]
+                    rows_2d = [header_row]
                     
                     for vehicle in vehicles:
                         # Build row in canonical schema order and clean "None" strings
@@ -3598,6 +4374,8 @@ def _extract_table_with_vision_api(
                             if isinstance(value, str) and value.strip().lower() == "none":
                                 value = None
                             row.append(value)
+                        # Preserve _is_handwritten flag
+                        row.append(vehicle.get("_is_handwritten", False))
                         rows_2d.append(row)
                     
                     return rows_2d
@@ -3614,6 +4392,26 @@ def _extract_table_with_vision_api(
         image_rows_collector = [] if source_type == SourceType.IMAGE else None
         
         # Process images (PDF/IMAGE sources)
+        # #region agent log
+        if source_type == SourceType.PDF:
+            with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
+                f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H1","location":"sources.py:3632","message":"_extract_table_with_vision_api: Starting page loop","data":{"images_count":len(images),"page_text_blocks_dict_keys":list(page_text_blocks_dict.keys()) if page_text_blocks_dict else [],"source_type":source_type.name},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
+        # #endregion
+        
+        # Detect if this is a handwritten PDF (by file path) - do this ONCE before the page loop
+        # Also check if PDF was routed as IMAGE (scanned PDF detection)
+        is_handwritten_pdf = False
+        is_scanned_pdf_routed_as_image = False
+        if source_type == SourceType.PDF:
+            file_path_str = str(file_path).lower()
+            is_handwritten_pdf = any(keyword in file_path_str for keyword in ['handwritten', 'hand'])
+            if is_handwritten_pdf:
+                logger.info(f"[Vision] Handwritten PDF detected: {file_path.name} - Using image-first Vision extraction")
+        elif source_type == SourceType.IMAGE and is_actually_pdf:
+            # PDF file routed as IMAGE means it was detected as scanned/handwritten
+            is_scanned_pdf_routed_as_image = True
+            logger.info(f"[Vision] Scanned PDF detected and routed as IMAGE: {file_path.name} - Using image-first Vision extraction (skipping OCR-first path)")
+        
         for page_idx, img in enumerate(images):
             page_num = page_idx + 1
             
@@ -3622,43 +4420,168 @@ def _extract_table_with_vision_api(
             img.save(buffered, format="PNG")
             img_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
             
-            # Get OCR text for this page if available
+            # Get OCR text for this page if available (but skip for handwritten PDFs and scanned PDFs routed as IMAGE - use as fallback only)
             page_ocr_text = ""
-            if page_num in page_text_blocks_dict:
-                try:
-                    from ocr.table_extract import _extract_raw_text
-                    page_ocr_text = _extract_raw_text(page_text_blocks_dict[page_num])
-                except Exception:
-                    pass
+            if not is_handwritten_pdf and not is_scanned_pdf_routed_as_image:
+                # For non-handwritten PDFs and regular IMAGE sources, get OCR text as before
+                # Skip OCR text extraction for scanned PDFs routed as IMAGE (they go straight to Vision API)
+                if page_num in page_text_blocks_dict:
+                    try:
+                        from ocr.table_extract import _extract_raw_text
+                        page_ocr_text = _extract_raw_text(page_text_blocks_dict[page_num])
+                    except Exception:
+                        pass
+                elif (source_type == SourceType.PDF or (source_type == SourceType.IMAGE and is_actually_pdf)) and not page_text_blocks_dict:
+                    # If no page_text_blocks_dict was provided, extract OCR text for all pages on-the-fly
+                    # CRITICAL: Only process the full OCR text ONCE (on page 1), not on every page
+                    # Otherwise we'll extract the same vehicles multiple times (6 pages × 6 vehicles = 36 rows)
+                    if not hasattr(_extract_table_with_vision_api, '_cached_full_ocr_text'):
+                        # Cache the full OCR text so we don't extract it multiple times
+                        try:
+                            full_ocr_text = _get_vision_ocr_text_for_pdf(file_path)
+                            _extract_table_with_vision_api._cached_full_ocr_text = full_ocr_text
+                            logger.info(f"[Vision] Extracted full Vision OCR text ({len(full_ocr_text)} chars) for all pages")
+                        except Exception as e:
+                            logger.debug(f"[Vision] Could not extract Vision OCR text: {e}")
+                            _extract_table_with_vision_api._cached_full_ocr_text = ""
+                    
+                    # Only use cached full OCR text on page 1 (process once, not per page)
+                    if page_num == 1:
+                        page_ocr_text = getattr(_extract_table_with_vision_api, '_cached_full_ocr_text', "")
+                        if page_ocr_text:
+                            logger.debug(f"[Vision] Using cached full Vision OCR text for page {page_num} ({len(page_ocr_text)} chars)")
+                    else:
+                        # Skip OCR text extraction for pages 2+ (already processed on page 1)
+                        page_ocr_text = ""
+                        logger.debug(f"[Vision] Skipping OCR text extraction for page {page_num} (already processed on page 1)")
             
-            # For PDF sources: PDF → text → block segmentation → extract_fields_from_block
-            # Disable Vision API as primary source - use pure text extraction first
-            if source_type == SourceType.PDF and page_ocr_text:
-                # After OCR text is obtained, force segmentation the same way
-                blocks = split_by_vin(page_ocr_text)
-                rows = [extract_fields_from_block(b, mapping=mapping_config, source_type="pdf") for b in blocks]
-                # If we successfully extracted vehicles from segmented blocks, use them
-                pdf_vehicles = [r for r in rows if r and r.get('vin')]
-                if pdf_vehicles:
-                    logger.info(f"[PDF] Extracted {len(pdf_vehicles)} vehicle(s) from page {page_num} segmented OCR text")
-                    # Convert to 2D array format and clean "None" strings
-                    for vehicle in pdf_vehicles:
-                        row = []
-                        for field in canonical_schema:
-                            value = vehicle.get(field)
-                            # Clean "None" strings
-                            if isinstance(value, str) and value.strip().lower() == "none":
-                                value = None
-                            row.append(value)
-                        all_rows.append(row)
-                    vision_extracted_pages.append(page_num)
-                    continue  # Skip Vision API for this page since text extraction succeeded
+            # For handwritten PDFs: Skip OCR text path, go straight to Vision API (image-first extraction)
+            # For scanned PDFs routed as IMAGE: Skip OCR text path entirely, go straight to Vision API
+            # For non-handwritten PDFs: PDF → text → block segmentation → extract_fields_from_block
+            # For regular IMAGE sources: Use OCR text if available
+            if (source_type == SourceType.PDF and not is_handwritten_pdf) or (source_type == SourceType.IMAGE and not is_scanned_pdf_routed_as_image):
+                # Only use OCR text path for:
+                # - Non-handwritten PDFs
+                # - Regular IMAGE sources (not scanned PDFs routed as IMAGE)
+                if page_ocr_text:
+                    # #region agent log
+                    with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
+                        f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H2","location":"sources.py:3975","message":"OCR text path: Entry","data":{"source_type":source_type.name,"page_num":page_num,"has_page_ocr_text":bool(page_ocr_text),"ocr_text_length":len(page_ocr_text) if page_ocr_text else 0},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
+                        # #endregion
+                    # Pre-split extraction: Extract document-level defaults from full OCR text
+                    # (for handwritten PDF/image or PNG images where fields may be lost during splitting)
+                    source_type_str = "pdf" if source_type == SourceType.PDF else "image"
+                    # #region agent log
+                    with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
+                        f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H1","location":"sources.py:4213","message":"OCR text path: Calling _extract_document_level_defaults","data":{"source_type_str":source_type_str,"page_ocr_text_length":len(page_ocr_text) if page_ocr_text else 0},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
+                    # #endregion
+                    document_defaults = _extract_document_level_defaults(page_ocr_text, source_type_str, file_path)
+                    
+                    # After OCR text is obtained, force segmentation the same way
+                    blocks = split_by_vin(page_ocr_text)
+                    rows = [extract_fields_from_block(b, mapping=mapping_config, source_type=source_type_str) for b in blocks]
+                    
+                    # Apply document-level defaults to each vehicle if field is still None
+                    applied_count = 0
+                    for vehicle_idx, vehicle in enumerate(rows):
+                        if vehicle:
+                            for field in ['body_style', 'fuel_type', 'transmission', 'mileage']:
+                                if vehicle.get(field) is None and document_defaults.get(field) is not None:
+                                    vehicle[field] = document_defaults[field]
+                                    applied_count += 1
+                                    # #region agent log
+                                    with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
+                                        f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H4","location":"sources.py:4224","message":"OCR text path: Applied default to vehicle","data":{"vehicle_idx":vehicle_idx,"field":field,"value":document_defaults[field],"vin":vehicle.get('vin')},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
+                                    # #endregion
+                    if applied_count > 0:
+                        print(f"[Pre-split extraction] Applied {applied_count} document-level default(s) to {len(rows)} vehicle(s)")
+                    # #region agent log
+                    with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
+                        f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H4","location":"sources.py:4227","message":"OCR text path: Defaults application summary","data":{"applied_count":applied_count,"total_vehicles":len(rows),"document_defaults":document_defaults},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
+                    # #endregion
+                    # If we successfully extracted vehicles from segmented blocks, use them
+                    extracted_vehicles = [r for r in rows if r and r.get('vin')]
+                    # #region agent log
+                    with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
+                        f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H2","location":"sources.py:3981","message":"OCR text path: After extraction","data":{"blocks_count":len(blocks),"rows_count":len(rows),"extracted_vehicles_count":len(extracted_vehicles),"vins":[(v.get('vin') if v else None) for v in extracted_vehicles[:5]]},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
+                    # #endregion
+                    if extracted_vehicles:
+                        logger.info(f"[{source_type.name}] Extracted {len(extracted_vehicles)} vehicle(s) from page {page_num} segmented OCR text")
+                        # #region agent log
+                        with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
+                            f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H1","location":"sources.py:4290","message":"OCR text path: Using OCR extracted vehicles","data":{"extracted_vehicles_count":len(extracted_vehicles)},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
+                        # #endregion
+                        # Convert to 2D array format and clean "None" strings
+                        for vehicle in extracted_vehicles:
+                            vin_value = vehicle.get('vin')
+                            # #region agent log
+                            if source_type == SourceType.IMAGE:
+                                with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
+                                    f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H2","location":"sources.py:3990","message":"OCR text path: Processing vehicle","data":{"vin_value":vin_value,"vin_type":type(vin_value).__name__ if vin_value else None,"source_type":source_type.name},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
+                            # #endregion
+                            # SAFEGUARD: Skip vehicles with invalid VINs (header tokens) for IMAGE sources
+                            if source_type == SourceType.IMAGE and vin_value:
+                                vin_upper_clean = str(vin_value).upper().strip().rstrip('.,;:!?')
+                                invalid_vin_tokens = {'YEAR', 'MAKE', 'MODEL', 'COLOR', 'MILEAGE', 'VIN', 
+                                                      'BODY', 'PAINTED', 'GASOLINE', 'TRANSMISSION', 'NOTES',
+                                                      'CURRENT', 'EXTERIOR', 'ADDITIONAL', 'DETAIL', 'SHEET',
+                                                      'STYLE', 'TYPE', 'EMAIL', 'FUEL', 'BODY_STYLE', 'FUEL_TYPE'}
+                                if vin_upper_clean in invalid_vin_tokens:
+                                    logger.debug(f"[IMAGE] Skipping vehicle with invalid VIN (header token): {vin_value} -> {vin_upper_clean}")
+                                    # #region agent log
+                                    with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
+                                        f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H2","location":"sources.py:4000","message":"OCR text path: Filtered invalid VIN","data":{"vin":vin_value,"vin_upper_clean":vin_upper_clean,"source_type":source_type.name},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
+                                    # #endregion
+                                    continue  # Skip this vehicle - it has an invalid VIN
+                            # #region agent log
+                            if source_type == SourceType.IMAGE:
+                                with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
+                                    f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H2","location":"sources.py:4006","message":"OCR text path: Adding vehicle to collector","data":{"vin_value":vin_value,"source_type":source_type.name},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
+                            # #endregion
+                            row = []
+                            for field in canonical_schema:
+                                value = vehicle.get(field)
+                                # Clean "None" strings
+                                if isinstance(value, str) and value.strip().lower() == "none":
+                                    value = None
+                                row.append(value)
+                            # Preserve _is_handwritten flag as extra field
+                            row.append(vehicle.get("_is_handwritten", False))
+                            # #region agent log
+                            if vin_value == 'ST420RJ98FDHKL4E':
+                                with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
+                                    f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H1","location":"sources.py:3658","message":"PDF Row 6: 2D array conversion","data":{"vin":vin_value,"year":row[canonical_schema.index('year')] if 'year' in canonical_schema else None,"make":row[canonical_schema.index('make')] if 'make' in canonical_schema else None,"model":row[canonical_schema.index('model')] if 'model' in canonical_schema else None,"color":row[canonical_schema.index('color')] if 'color' in canonical_schema else None,"owner_email":row[canonical_schema.index('owner_email')] if 'owner_email' in canonical_schema else None,"transmission":row[canonical_schema.index('transmission')] if 'transmission' in canonical_schema else None,"source_type":source_type.name},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
+                            if source_type == SourceType.IMAGE:
+                                with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
+                                    f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H6","location":"sources.py:3660","message":"IMAGE: Adding row to collector","data":{"vin":vin_value,"row_length":len(row),"collector_size_before":len(image_rows_collector) if image_rows_collector else 0},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
+                            # #endregion
+                            # For IMAGE sources, collect rows for aggregation AFTER all pages
+                            if source_type == SourceType.IMAGE:
+                                image_rows_collector.append(row)
+                            else:
+                                all_rows.append(row)
+                        vision_extracted_pages.append(page_num)
+                        continue  # Skip Vision API for this page since text extraction succeeded
                 
                 # If text extraction didn't work, only then try Vision API as supplement
                 # (but don't overwrite good text-extracted fields)
-                page_ocr_text = "\n\n--- VEHICLE SEPARATOR ---\n\n".join(blocks)
-                logger.debug(f"[PDF] Text extraction incomplete, trying Vision API supplement for page {page_num}")
+                # NOTE: blocks is only defined if we went through the OCR text path above
+                # If we skipped OCR path (handwritten/scanned PDFs), blocks won't exist, so skip this fallback
+                if 'blocks' in locals() and blocks:
+                    page_ocr_text = "\n\n--- VEHICLE SEPARATOR ---\n\n".join(blocks)
+                    logger.debug(f"[PDF] Text extraction incomplete, trying Vision API supplement for page {page_num}")
+                    # #region agent log
+                    with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
+                        f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H1","location":"sources.py:4292","message":"OCR text path: Falling back to Vision API","data":{"page_num":page_num,"blocks_count":len(blocks)},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
+                    # #endregion
+                else:
+                    # OCR text path was skipped (handwritten/scanned PDFs) - no blocks to join
+                    # page_ocr_text will be empty, Vision API will process image directly
+                    page_ocr_text = ""
+                    logger.debug(f"[Vision] OCR text path skipped for page {page_num}, proceeding to Vision API (image-first)")
             
+            # For handwritten PDFs: Try Vision API FIRST (image-first extraction)
+            # For other PDFs/IMAGES: Try Vision API as supplement/fallback
             # Try Vision API for this page
             user_prompt_text = (
                 f"This is page {page_num} of a vehicle data document. "
@@ -3670,10 +4593,55 @@ def _extract_table_with_vision_api(
                 "- Each vehicle is defined by its VIN block - extract only fields within the same block as each VIN\n"
                 "- Do NOT reuse fields from previous vehicles\n"
                 "- Extract values EXACTLY as written - do NOT reword, summarize, or paraphrase\n"
+                "- Extract ALL fields for each vehicle - do NOT skip any fields (use null if missing)\n"
+                "- For each vehicle, you MUST attempt to extract: VIN, year, make, model, color, mileage, body_style, fuel_type, transmission, owner_email, and notes\n"
+                "- CRITICAL: For TABLE images, read EVERY column for each data row - extract values from ALL columns (YEAR, MAKE, MODEL, COLOR, MILEAGE, BODY, FUEL, TRANSMISSION, EMAIL, NOTES, etc.)\n"
+                "- Do NOT skip columns - if a column exists in the table, extract its value for each row (use null only if the cell is truly empty)\n"
+                "- Even if a field value seems invalid (e.g., year=1899, mileage=-100, bad email format), extract it anyway - do NOT drop the field\n"
                 "- For the notes field: if present, copy VERBATIM - preserve original wording, punctuation, and order\n"
                 "- If notes are missing, set notes = null (not empty string)\n"
                 "- When uncertain about a value, extract your best guess rather than omitting it\n"
                 "- For invalid values (e.g., negative mileage, invalid year), extract them anyway - do NOT drop the field\n"
+                "- DO NOT include table header rows - only extract rows with valid 17-character VINs\n"
+                "- If you see a table, skip the header row entirely - do NOT include it in the output\n"
+                "\n"
+                "SECTION-BASED EXTRACTION (ESPECIALLY FOR HANDWRITTEN DOCUMENTS):\n"
+                "- Identify each distinct SECTION or BLOCK of vehicle information on this page\n"
+                "- Each section represents ONE complete vehicle record\n"
+                "- Look for visual separators between sections:\n"
+                "  * Blank lines or spacing\n"
+                "  * Horizontal lines, boxes, or borders\n"
+                "  * Each VIN typically marks the start of a new section\n"
+                "  * All information for one vehicle is grouped within its section\n"
+                "- For handwritten documents: sections may be less clearly defined, but each vehicle's information is typically grouped together\n"
+                "- Extract ONE row per section you identify\n"
+                "- If you see 3 distinct sections with vehicle information, extract 3 rows (one per section)\n"
+                "- DO NOT combine information from different sections into one row\n"
+                "- DO NOT skip sections - if a section contains a valid VIN, extract it as a separate row\n"
+                "- Within each section, extract ALL fields that appear in that section\n"
+                "- If a section is missing some fields, use null for those fields but still extract the section as a row\n"
+                "\n"
+                "CRITICAL FIELD EXTRACTION FOR HANDWRITTEN/SECTION-BASED DOCUMENTS:\n"
+                "- For EACH vehicle section, you MUST actively look for and extract these specific fields:\n"
+                "  * body_style: Look for words like 'sedan', 'truck', 'SUV', 'coupe', 'van', 'convertible', 'wagon', 'hatchback', 'crossover'\n"
+                "    - Examples: '2024 Toyota Camry sedan', 'Ford F-150 truck', 'Honda CR-V SUV'\n"
+                "    - The body style may appear anywhere in the section text, not just after a label\n"
+                "  * fuel_type: Look for words like 'gas', 'gasoline', 'diesel', 'electric', 'hybrid'\n"
+                "    - Examples: 'Fuel: gas', 'Fuel: gasoline', 'runs on diesel', 'electric vehicle', 'hybrid car'\n"
+                "    - May appear as 'Fuel: X' OR just 'gas' or 'gasoline' mentioned anywhere in the section\n"
+                "  * transmission: Look for words like 'automatic', 'manual', 'CVT', 'auto'\n"
+                "    - Examples: 'automatic transmission', 'transmission: automatic', '8-speed auto', 'manual shift'\n"
+                "    - May appear as 'Transmission: X' OR just 'automatic' or 'manual' mentioned anywhere in the section\n"
+                "  * owner_email: Look for email addresses (format: text@domain.com) - extract EXACTLY as written, even if format seems invalid\n"
+                "  * color: Look for color words like 'Blue', 'Red', 'Green', 'Black', 'White', etc. (may appear as 'painted blue' or 'Color: Blue')\n"
+                "  * mileage: Look for numbers followed by 'miles' or 'mileage'\n"
+                "    - Examples: '12,345 miles', '100,245 miles', 'about 89,000 miles', '45,210 miles on odometer'\n"
+                "    - May include phrases like 'about X miles', 'X miles on odometer', 'odometer shows X miles'\n"
+                "- These fields are often written in natural language within each section - read the ENTIRE section text carefully\n"
+                "- Do NOT skip these fields - if you see ANY mention of body style, fuel type, or transmission in a section, extract it\n"
+                "- For handwritten documents, these fields may be written in various formats - look for keywords ANYWHERE in the section text\n"
+                "- IMPORTANT: Even if a field is mentioned without a label (e.g., just 'sedan' or 'gas' or 'automatic'), you MUST extract it\n"
+                "- Do NOT assume fields are missing just because they don't have structured labels - search the entire section text\n"
             )
             
             if page_ocr_text:
@@ -3681,15 +4649,98 @@ def _extract_table_with_vision_api(
                     f"\n\nOCR-extracted text from this page (vehicles separated by '--- VEHICLE SEPARATOR ---'):\n{page_ocr_text[:2000]}\n\n"
                     "Use this OCR text to help identify all vehicles and their field boundaries. "
                     "Each section between separators represents one vehicle. "
-                    "Extract values from the OCR text EXACTLY as written - do NOT modify or reword."
+                    "Extract values from the OCR text EXACTLY as written - do NOT modify or reword. "
+                    "\n"
+                    "IMPORTANT: Even if the OCR text shows separators, also look at the IMAGE itself to identify sections. "
+                    "For handwritten documents, the image may show clearer section boundaries than the OCR text. "
+                    "Count how many distinct vehicle sections you see in the image and extract that many rows."
+                )
+            
+            # Detect if this might be a handwritten document based on filename or content
+            is_handwritten_doc = any(keyword in str(file_path).lower() for keyword in ['handwritten', 'hand', 'scribble', 'notes'])
+            
+            if is_handwritten_doc:
+                user_prompt_text += (
+                    "\n\nHANDWRITTEN DOCUMENT DETECTED - SPECIAL INSTRUCTIONS:\n"
+                    "- This appears to be a handwritten document - text may be less structured\n"
+                    "- CRITICAL: Handwritten documents are typically NOT in table format - they are organized as SEPARATE BLOCKS or SECTIONS\n"
+                    "- Each vehicle's information is written in its own distinct block/section, NOT in table rows\n"
+                    "- Look carefully for ALL distinct SECTIONS or BLOCKS of vehicle information\n"
+                    "- Each section typically contains one complete vehicle with all its fields grouped together\n"
+                    "- Sections may be separated by:\n"
+                    "  * Blank space or lines\n"
+                    "  * Visual boundaries (boxes, lines, borders)\n"
+                    "  * Each VIN usually marks the start of a new section\n"
+                    "  * Each section is a self-contained block of text describing one vehicle\n"
+                    "- Count how many distinct vehicle sections/blocks you see - extract that many rows\n"
+                    "- If you see 3 separate blocks with vehicle information, extract 3 rows (one per block)\n"
+                    "- DO NOT combine multiple blocks into one row\n"
+                    "- DO NOT skip blocks - extract every block that contains vehicle information\n"
+                    "- Within each block, extract all fields that appear, even if handwriting is difficult to read\n"
+                    "- CRITICAL: For handwritten documents, fields may appear in natural language without labels:\n"
+                    "  * Body style: Look for 'sedan', 'truck', 'SUV', etc. anywhere in the block (e.g., '2024 Toyota Camry sedan')\n"
+                    "  * Fuel type: Look for 'gas', 'gasoline', 'diesel', etc. anywhere in the block (e.g., 'runs on gas' or just 'gas')\n"
+                    "  * Transmission: Look for 'automatic', 'manual', 'auto' anywhere in the block (e.g., 'automatic transmission' or just 'automatic')\n"
+                    "  * Mileage: Look for numbers with 'miles' anywhere (e.g., '100,245 miles', 'about 89,000 miles')\n"
+                    "  * Color: Look for color words anywhere (e.g., 'painted blue', 'red car', 'green vehicle')\n"
+                    "- IMPORTANT: Handwritten documents are NOT tables - do NOT look for column headers or rows\n"
+                    "- Instead, identify each separate text block that contains vehicle information\n"
+                    "- Each block is a paragraph or section of text describing one vehicle\n"
+                    "- Read each block as a whole and extract all fields mentioned within that block\n"
+                    "- Be careful with OCR character recognition errors:\n"
+                    "  * 'B' might appear as '8' or 'E'\n"
+                    "  * 'F' might appear as 'E'\n"
+                    "  * '1' might appear as 'I' or 'l'\n"
+                    "  * 'Z' might appear as '7' or '2'\n"
+                    "  * '0' might appear as 'O'\n"
+                    "  * '2' might appear as 'Z'\n"
+                    "- If a VIN looks suspicious, try to correct obvious OCR errors based on context\n"
+                    "- Validate that VINs are 17 characters and contain at least 2 digits\n"
+                    "- Extract ALL fields visible in each block, even if some are unclear\n"
+                    "- DO NOT skip fields just because they don't have labels - search the entire block text for keywords\n"
+                    "\n"
                 )
             
             user_prompt_text += (
-                f"\n\nOUTPUT REQUIREMENTS:\n"
+                "\n\nEXTRACTION CONSTRAINTS (CRITICAL):\n"
+                "- Always return all vehicle schema fields explicitly in every row\n"
+                "- If a field is not visible or cannot be determined, return null instead of omitting it\n"
+                "- DO NOT drop fields simply because they are unlabeled - infer from natural language when possible\n"
+                "\n"
+                "NATURAL LANGUAGE INFERENCE (REQUIRED):\n"
+                "Infer the following fields from natural language anywhere in the document section, even if unlabeled:\n"
+                "- body_style: Search for keywords like 'sedan', 'truck', 'SUV', 'van', 'coupe', 'hatchback', 'convertible', 'wagon', 'crossover'\n"
+                "  * Normalize to canonical forms: 'sedan', 'truck', 'suv', 'van', 'coupe', 'hatchback', 'convertible', 'wagon', 'crossover'\n"
+                "  * Examples: '2024 Toyota Camry sedan' → body_style: 'sedan', 'Ford F-150 truck' → body_style: 'truck'\n"
+                "- fuel_type: Search for keywords like 'gas', 'gasoline', 'diesel', 'electric', 'hybrid'\n"
+                "  * Normalize to canonical forms: 'gasoline' (for 'gas' or 'gasoline'), 'diesel', 'electric', 'hybrid'\n"
+                "  * Examples: 'runs on gas' → fuel_type: 'gasoline', 'diesel engine' → fuel_type: 'diesel'\n"
+                "- transmission: Search for keywords like 'automatic', 'manual', 'CVT', 'auto'\n"
+                "  * Normalize to canonical forms: 'automatic' (for 'auto' or 'automatic'), 'manual', 'cvt'\n"
+                "  * Examples: 'automatic transmission' → transmission: 'automatic', '8-speed auto' → transmission: 'automatic'\n"
+                "- mileage: Search for numbers followed by 'miles', 'mi', 'mileage', or 'odometer'\n"
+                "  * Extract numeric value only (remove commas, 'miles', etc.)\n"
+                "  * Examples: '100,245 miles' → mileage: 100245, 'odometer: 89,000' → mileage: 89000\n"
+                "\n"
+                "NORMALIZATION REQUIREMENTS:\n"
+                "- Normalize inferred values to canonical forms used by normalize_v2:\n"
+                "  * body_style: lowercase (e.g., 'SUV' → 'suv', 'Truck' → 'truck')\n"
+                "  * fuel_type: 'gas' or 'gasoline' → 'gasoline', 'auto' → 'automatic'\n"
+                "  * transmission: 'auto' → 'automatic', 'CVT' → 'cvt'\n"
+                "  * mileage: numeric integer only (remove commas, text, units)\n"
+                "\n"
+                "FIELD COMPLETENESS:\n"
+                "- Every row MUST include all schema fields in the exact order specified\n"
+                "- Use null for missing fields - never omit fields from the output\n"
+                "- Search the entire document section for natural language mentions of these fields\n"
+                "- Do NOT skip fields just because they lack explicit labels\n"
+                "\n"
+                f"\nOUTPUT REQUIREMENTS:\n"
                 f"- Return ONE row per vehicle with exactly {len(canonical_schema)} values matching the headers\n"
                 "- If a field is missing, use null (not empty string, not \"\", not \"N/A\")\n"
                 "- Output ONLY valid JSON - no markdown, no explanations, no additional text\n"
                 "- Do NOT wrap the JSON in code blocks (```json)\n"
+                "- Count the number of distinct vehicle sections you identified and extract that many rows\n"
             )
             
             user_content = [
@@ -3700,6 +4751,9 @@ def _extract_table_with_vision_api(
             # Call Vision API for this page
             page_rows = None
             try:
+                # Debug: Print first 300 chars of system prompt to verify correct prompt is used
+                logger.debug(f"[Vision] System prompt preview (first 300 chars): {system_prompt[:300]}")
+                
                 response = client.chat.completions.create(
                     model=vision_model,
                     messages=[
@@ -3723,12 +4777,28 @@ def _extract_table_with_vision_api(
                         data = json.loads(content)
                         if isinstance(data, dict):
                             rows = data.get("rows", [])
+                            # #region agent log
+                            if source_type == SourceType.IMAGE:
+                                with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
+                                    f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H1","location":"sources.py:4154","message":"Vision API structured JSON: Entry","data":{"rows_count":len(rows) if rows else 0,"page_num":page_num,"source_type":source_type.name},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
+                            # #endregion
                             if rows and isinstance(rows, list):
                                 # Normalize rows to canonical schema
                                 normalized_page_rows = []
-                                for row in rows:
+                                for row_idx, row in enumerate(rows):
                                     if not isinstance(row, list):
                                         continue
+                                    # #region agent log
+                                    if source_type == SourceType.IMAGE:
+                                        # Log raw Vision API response to see what fields are extracted
+                                        raw_row_dict = {}
+                                        for j in range(min(len(row), len(canonical_schema))):
+                                            field_name = canonical_schema[j]
+                                            raw_value = row[j] if j < len(row) else None
+                                            raw_row_dict[field_name] = raw_value
+                                        with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
+                                            f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H8","location":"sources.py:4190","message":"Vision API raw row before normalization","data":{"row_idx":row_idx,"page_num":page_num,"raw_row":raw_row_dict,"row_length":len(row),"schema_length":len(canonical_schema)},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
+                                    # #endregion
                                     normalized_row = []
                                     for j in range(len(canonical_schema)):
                                         raw_value = row[j] if j < len(row) else None
@@ -3738,6 +4808,11 @@ def _extract_table_with_vision_api(
                                         normalized_value = _normalize_vision_value(field_name, raw_value, preserve_raw=True)
                                         normalized_row.append(normalized_value)
                                     normalized_page_rows.append(normalized_row)
+                                # #region agent log
+                                if source_type == SourceType.IMAGE:
+                                    with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
+                                        f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H1","location":"sources.py:4169","message":"Vision API structured JSON: After normalization","data":{"normalized_rows_count":len(normalized_page_rows),"page_num":page_num,"source_type":source_type.name},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
+                                # #endregion
                                 
                                 if normalized_page_rows:
                                     # Clean "None" strings from Vision API results
@@ -3745,13 +4820,186 @@ def _extract_table_with_vision_api(
                                         for i, value in enumerate(row):
                                             if isinstance(value, str) and value.strip().lower() == "none":
                                                 row[i] = None
-                                    page_rows = normalized_page_rows
-                                    vision_extracted_pages.append(page_num)
-                                    logger.info(f"[Vision] Extracted {len(normalized_page_rows)} row(s) from page {page_num}")
+                                    
+                                    # SAFEGUARD: Filter out rows with invalid VINs (header tokens, table headers)
+                                    # Expanded list to catch all header tokens that might be misidentified as VINs
+                                    valid_rows = []
+                                    vin_index = canonical_schema.index('vin') if 'vin' in canonical_schema else 0
+                                    invalid_vin_tokens = {'YEAR', 'MAKE', 'MODEL', 'COLOR', 'MILEAGE', 'VIN', 'TRANSMISSION', 
+                                                          'BODY_STYLE', 'FUEL_TYPE', 'OWNER_EMAIL', 'NOTES', 'VEHICLE_ID', 
+                                                          'EFFECTIVE_DATE', 'TRIM', 'WEIGHT', 'BODY', 'PAINTED', 'GASOLINE',
+                                                          'CURRENT', 'EXTERIOR', 'ADDITIONAL', 'DETAIL', 'SHEET', 'STYLE',
+                                                          'TYPE', 'EMAIL', 'FUEL', 'BODY_TYPE', 'CURRENT_MILEAGE',
+                                                          'EXTERIOR_COLOR'}
+                                    # #region agent log
+                                    if source_type == SourceType.IMAGE:
+                                        with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
+                                            f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H1","location":"sources.py:4181","message":"Vision API structured JSON: Starting filtering","data":{"vin_index":vin_index,"normalized_rows_count":len(normalized_page_rows),"page_num":page_num,"source_type":source_type.name},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
+                                    # #endregion
+                                    for row in normalized_page_rows:
+                                        if len(row) > vin_index:
+                                            vin_value = row[vin_index]
+                                            # #region agent log
+                                            if source_type == SourceType.IMAGE:
+                                                with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
+                                                    f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H1","location":"sources.py:4191","message":"Vision API structured JSON: Checking row","data":{"vin_value":vin_value,"vin_type":type(vin_value).__name__ if vin_value else None,"vin_is_string":isinstance(vin_value, str) if vin_value else False,"row_length":len(row),"page_num":page_num},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
+                                            # #endregion
+                                            # Skip rows where VIN is a header token or invalid
+                                            if vin_value and isinstance(vin_value, str):
+                                                # Strip punctuation and whitespace before checking
+                                                vin_upper_clean = vin_value.strip().upper().rstrip('.,;:!?')
+                                                # Check if VIN is a header token
+                                                if vin_upper_clean in invalid_vin_tokens:
+                                                    logger.warning(f"[Vision] Filtering row with invalid VIN (header token): {vin_value} -> {vin_upper_clean}")
+                                                    # #region agent log
+                                                    if source_type == SourceType.IMAGE:
+                                                        with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
+                                                            f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H1","location":"sources.py:4197","message":"Vision API structured JSON: Filtered invalid VIN","data":{"vin_value":vin_value,"vin_upper_clean":vin_upper_clean,"page_num":page_num},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
+                                                    # #endregion
+                                                    continue
+                                                # Check if VIN is too short or doesn't look like a valid VIN
+                                                if len(vin_upper_clean) < 10:  # Valid VINs are typically 17 chars, but allow some tolerance
+                                                    logger.debug(f"[Vision] Filtering row with invalid VIN (too short): {vin_value}")
+                                                    # #region agent log
+                                                    if source_type == SourceType.IMAGE:
+                                                        with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
+                                                            f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H1","location":"sources.py:4201","message":"Vision API structured JSON: Filtered short VIN","data":{"vin_value":vin_value,"vin_length":len(vin_upper_clean),"page_num":page_num},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
+                                                    # #endregion
+                                                    continue
+                                            # #region agent log
+                                            if source_type == SourceType.IMAGE:
+                                                with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
+                                                    f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H1","location":"sources.py:4204","message":"Vision API structured JSON: Adding valid row","data":{"vin_value":vin_value,"page_num":page_num},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
+                                            # #endregion
+                                            valid_rows.append(row)
+                                        else:
+                                            # Row doesn't have enough columns, skip it
+                                            logger.debug(f"[Vision] Filtering row with insufficient columns: {len(row)} < {vin_index + 1}")
+                                            # #region agent log
+                                            if source_type == SourceType.IMAGE:
+                                                with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
+                                                    f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H1","location":"sources.py:4207","message":"Vision API structured JSON: Filtered insufficient columns","data":{"row_length":len(row),"vin_index":vin_index,"page_num":page_num},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
+                                            # #endregion
+                                    
+                                    # #region agent log
+                                    if source_type == SourceType.IMAGE:
+                                        with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
+                                            f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H1","location":"sources.py:4209","message":"Vision API structured JSON: Filtering complete","data":{"valid_rows_count":len(valid_rows),"normalized_rows_count":len(normalized_page_rows),"filtered_count":len(normalized_page_rows) - len(valid_rows),"page_num":page_num},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
+                                    # #endregion
+                                    if valid_rows:
+                                        # Apply document-level defaults to Vision API results if OCR text is available
+                                        # (for handwritten PDF/image or PNG images where Vision API might miss fields)
+                                        source_type_str = "pdf" if source_type == SourceType.PDF else "image"
+                                        # #region agent log
+                                        with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
+                                            f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H1","location":"sources.py:4559","message":"Vision API path: Checking for OCR text","data":{"has_page_ocr_text":bool(page_ocr_text),"page_ocr_text_length":len(page_ocr_text) if page_ocr_text else 0,"valid_rows_count":len(valid_rows)},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
+                                        # #endregion
+                                        if page_ocr_text:
+                                            vision_document_defaults = _extract_document_level_defaults(page_ocr_text, source_type_str, file_path)
+                                            # Apply defaults to each Vision API row by field index
+                                            vision_applied_count = 0
+                                            for row_idx, row in enumerate(valid_rows):
+                                                if len(row) >= len(canonical_schema):
+                                                    for field in ['body_style', 'fuel_type', 'transmission', 'mileage']:
+                                                        if field in canonical_schema:
+                                                            field_idx = canonical_schema.index(field)
+                                                            if field_idx < len(row) and (row[field_idx] is None or row[field_idx] == ""):
+                                                                if vision_document_defaults.get(field) is not None:
+                                                                    row[field_idx] = vision_document_defaults[field]
+                                                                    vision_applied_count += 1
+                                                                    # #region agent log
+                                                                    vin_idx = canonical_schema.index('vin') if 'vin' in canonical_schema else -1
+                                                                    with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
+                                                                        f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H4","location":"sources.py:4569","message":"Vision API path: Applied default to row","data":{"row_idx":row_idx,"field":field,"value":vision_document_defaults[field],"vin":row[vin_idx] if vin_idx >= 0 and vin_idx < len(row) else None},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
+                                                                    # #endregion
+                                            # #region agent log
+                                            with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
+                                                f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H4","location":"sources.py:4572","message":"Vision API path: Defaults application summary","data":{"vision_applied_count":vision_applied_count,"total_rows":len(valid_rows),"vision_document_defaults":vision_document_defaults},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
+                                            # #endregion
+                                        
+                                        # For Vision API rows, append _is_handwritten flag based on file path
+                                        # Check if file path indicates handwriting
+                                        is_handwritten_doc = False
+                                        if file_path:
+                                            file_path_str = str(file_path).lower()
+                                            is_handwritten_doc = any(keyword in file_path_str for keyword in ['handwritten', 'hand'])
+                                        # Append _is_handwritten and _is_vision_extracted flags to each valid row
+                                        # Vision-extracted rows should NOT have VIN correction applied
+                                        for row in valid_rows:
+                                            if len(row) == len(canonical_schema):
+                                                row.append(is_handwritten_doc)
+                                                row.append(True)  # _is_vision_extracted = True
+                                            # If row already has extra fields, update them
+                                            elif len(row) == len(canonical_schema) + 1:
+                                                row[-1] = is_handwritten_doc
+                                                row.append(True)  # _is_vision_extracted = True
+                                            elif len(row) > len(canonical_schema) + 1:
+                                                row[-2] = is_handwritten_doc
+                                                row[-1] = True  # _is_vision_extracted = True
+                                        
+                                        page_rows = valid_rows
+                                        vision_extracted_pages.append(page_num)
+                                        logger.info(f"[Vision] Extracted {len(valid_rows)} valid row(s) from page {page_num} (filtered {len(normalized_page_rows) - len(valid_rows)} invalid rows)")
+                                    else:
+                                        logger.debug(f"[Vision] All rows from page {page_num} were filtered as invalid (likely header rows)")
+                                        page_rows = None
                     except (json.JSONDecodeError, KeyError, IndexError) as e:
                         logger.debug(f"[Vision] Failed to parse page {page_num} response: {e}")
+                        page_rows = None
             except Exception as e:
                 logger.debug(f"[Vision] API error for page {page_num}: {e}")
+                page_rows = None
+            
+            # For handwritten PDFs: If Vision API failed, fall back to OCR text extraction
+            if is_handwritten_pdf and (page_rows is None or len(page_rows) == 0):
+                logger.info(f"[Handwritten PDF] Vision API failed or returned no rows for page {page_num}, falling back to OCR text extraction")
+                # Extract OCR text for this page as fallback
+                try:
+                    if not hasattr(_extract_table_with_vision_api, '_cached_full_ocr_text'):
+                        full_ocr_text = _get_vision_ocr_text_for_pdf(file_path)
+                        _extract_table_with_vision_api._cached_full_ocr_text = full_ocr_text
+                        logger.info(f"[Handwritten PDF] Extracted OCR text ({len(full_ocr_text)} chars) for fallback")
+                    else:
+                        full_ocr_text = getattr(_extract_table_with_vision_api, '_cached_full_ocr_text', "")
+                    
+                    if full_ocr_text:
+                        # Use OCR text path as fallback (same logic as non-handwritten PDFs)
+                        page_ocr_text = full_ocr_text if page_num == 1 else ""
+                        if page_ocr_text:
+                            logger.info(f"[Handwritten PDF] Using OCR fallback for page {page_num}")
+                            # Pre-split extraction: Extract document-level defaults from full OCR text
+                            document_defaults = _extract_document_level_defaults(page_ocr_text, "pdf", file_path)
+                            
+                            # After OCR text is obtained, force segmentation the same way
+                            blocks = split_by_vin(page_ocr_text)
+                            rows = [extract_fields_from_block(b, mapping=mapping_config, source_type="pdf") for b in blocks]
+                            
+                            # Apply document-level defaults to each vehicle if field is still None
+                            for vehicle in rows:
+                                if vehicle:
+                                    for field in ['body_style', 'fuel_type', 'transmission', 'mileage']:
+                                        if vehicle.get(field) is None and document_defaults.get(field) is not None:
+                                            vehicle[field] = document_defaults[field]
+                            
+                            # If we successfully extracted vehicles from segmented blocks, use them
+                            extracted_vehicles = [r for r in rows if r and r.get('vin')]
+                            if extracted_vehicles:
+                                logger.info(f"[Handwritten PDF] OCR fallback extracted {len(extracted_vehicles)} vehicle(s) from page {page_num}")
+                                # Convert to 2D array format
+                                page_rows = []
+                                for vehicle in extracted_vehicles:
+                                    row = []
+                                    for field in canonical_schema:
+                                        value = vehicle.get(field)
+                                        if isinstance(value, str) and value.strip().lower() == "none":
+                                            value = None
+                                        row.append(value)
+                                    # Preserve _is_handwritten flag
+                                    row.append(vehicle.get("_is_handwritten", True))
+                                    page_rows.append(row)
+                except Exception as e:
+                    logger.debug(f"[Handwritten PDF] OCR fallback failed for page {page_num}: {e}")
+                    page_rows = None
             
             # If Vision extracted rows, use them (but only if text extraction didn't work)
             if page_rows:
@@ -3762,6 +5010,12 @@ def _extract_table_with_vision_api(
                         all_rows.extend(page_rows)
                 elif source_type == SourceType.IMAGE:
                     # For IMAGE sources, collect rows for aggregation AFTER all pages are processed
+                    # #region agent log
+                    with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
+                        vin_index = canonical_schema.index('vin') if 'vin' in canonical_schema else 0
+                        vins_in_page_rows = [row[vin_index] if len(row) > vin_index else None for row in page_rows[:5]]
+                        f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H1","location":"sources.py:4234","message":"Vision API structured JSON: Adding to collector","data":{"page_rows_count":len(page_rows),"collector_size_before":len(image_rows_collector) if image_rows_collector else 0,"vins_in_page_rows":vins_in_page_rows,"page_num":page_num},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
+                    # #endregion
                     image_rows_collector.extend(page_rows)
                 else:
                     all_rows.extend(page_rows)
@@ -3770,8 +5024,17 @@ def _extract_table_with_vision_api(
                 if page_ocr_text:
                     # For PDF, split OCR text into vehicle blocks and process each separately
                     if source_type == SourceType.PDF:
+                        # Pre-split extraction: Extract document-level defaults
+                        # file_path is available in _extract_table_with_vision_api scope
+                        document_defaults = _extract_document_level_defaults(page_ocr_text, "pdf", file_path)
                         blocks = split_by_vin(page_ocr_text)
                         rows = [extract_fields_from_block(b, mapping=mapping_config, source_type="pdf") for b in blocks]
+                        # Apply document-level defaults to each vehicle if field is still None
+                        for vehicle in rows:
+                            if vehicle:
+                                for field in ['body_style', 'fuel_type', 'transmission', 'mileage']:
+                                    if vehicle.get(field) is None and document_defaults.get(field) is not None:
+                                        vehicle[field] = document_defaults[field]
                         for vehicle in rows:
                             if vehicle and vehicle.get('vin'):
                                 # Convert to canonical schema row and clean "None" strings
@@ -3782,26 +5045,66 @@ def _extract_table_with_vision_api(
                                     if isinstance(value, str) and value.strip().lower() == "none":
                                         value = None
                                     canonical_row.append(value)
+                                # Preserve _is_handwritten flag as extra field
+                                canonical_row.append(vehicle.get("_is_handwritten", False))
                                 all_rows.append(canonical_row)
                     elif source_type == SourceType.IMAGE:
                         # For IMAGE sources, collect blocks for aggregation AFTER all pages
+                        # Pre-split extraction: Extract document-level defaults
+                        # file_path is available in _extract_table_with_vision_api scope
+                        document_defaults = _extract_document_level_defaults(page_ocr_text, "image", file_path)
+                        # #region agent log
+                        with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
+                            f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H2","location":"sources.py:4255","message":"OCR fallback path: Entry","data":{"has_page_ocr_text":bool(page_ocr_text),"page_num":page_num,"source_type":source_type.name},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
+                        # #endregion
                         blocks = split_by_vin(page_ocr_text)
                         extracted_vehicles = [extract_fields_from_block(b, mapping=mapping_config, source_type="image") for b in blocks]
+                        # Apply document-level defaults to each vehicle if field is still None
+                        for vehicle in extracted_vehicles:
+                            if vehicle:
+                                for field in ['body_style', 'fuel_type', 'transmission', 'mileage']:
+                                    if vehicle.get(field) is None and document_defaults.get(field) is not None:
+                                        vehicle[field] = document_defaults[field]
+                        # #region agent log
+                        with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
+                            f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H2","location":"sources.py:4258","message":"OCR fallback path: After extraction","data":{"blocks_count":len(blocks),"extracted_vehicles_count":len(extracted_vehicles),"vins":[(v.get('vin') if v else None) for v in extracted_vehicles[:5]]},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
+                        # #endregion
                         # Convert vehicles to canonical rows and collect for aggregation
                         # CRITICAL: Filter out rows with invalid VINs (header tokens) during collection
                         for vehicle in extracted_vehicles:
                             if vehicle:
                                 vin_value = vehicle.get('vin')
-                                # Skip vehicles with invalid VINs (header tokens like "YEAR", "MAKE", etc.)
-                                if vin_value and str(vin_value).upper() in {'YEAR', 'MAKE', 'MODEL', 'COLOR', 'MILEAGE', 'VIN'}:
-                                    logger.debug(f"[IMAGE] Skipping vehicle with invalid VIN: {vin_value}")
-                                    continue
+                                # #region agent log
+                                with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
+                                    f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H2","location":"sources.py:4263","message":"OCR fallback path: Processing vehicle","data":{"vin_value":vin_value,"vin_type":type(vin_value).__name__ if vin_value else None},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
+                                # #endregion
+                                # SAFEGUARD: Skip vehicles with invalid VINs (header tokens)
+                                # Use the same excluded words list as extract_fields_from_block
+                                if vin_value:
+                                    vin_upper_clean = str(vin_value).upper().strip().rstrip('.,;:!?')
+                                    invalid_vin_tokens = {'YEAR', 'MAKE', 'MODEL', 'COLOR', 'MILEAGE', 'VIN', 
+                                                          'BODY', 'PAINTED', 'GASOLINE', 'TRANSMISSION', 'NOTES',
+                                                          'CURRENT', 'EXTERIOR', 'ADDITIONAL', 'DETAIL', 'SHEET',
+                                                          'STYLE', 'TYPE', 'EMAIL', 'FUEL', 'BODY_STYLE', 'FUEL_TYPE'}
+                                    if vin_upper_clean in invalid_vin_tokens:
+                                        logger.debug(f"[IMAGE] Skipping vehicle with invalid VIN (header token): {vin_value}")
+                                        # #region agent log
+                                        with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
+                                            f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H2","location":"sources.py:4271","message":"OCR fallback path: Filtered invalid VIN","data":{"vin":vin_value,"vin_upper_clean":vin_upper_clean},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
+                                        # #endregion
+                                        continue
+                                # #region agent log
+                                with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
+                                    f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H2","location":"sources.py:4275","message":"OCR fallback path: Adding vehicle to collector","data":{"vin_value":vin_value},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
+                                # #endregion
                                 canonical_row = []
                                 for field in canonical_schema:
                                     value = vehicle.get(field)
                                     if isinstance(value, str) and value.strip().lower() == "none":
                                         value = None
                                     canonical_row.append(value)
+                                # Preserve _is_handwritten flag as extra field
+                                canonical_row.append(vehicle.get("_is_handwritten", False))
                                 image_rows_collector.append(canonical_row)
                     else:
                         # For non-PDF sources, use original fallback logic
@@ -3811,35 +5114,80 @@ def _extract_table_with_vision_api(
                             canonical_row = []
                             for field in canonical_schema:
                                 canonical_row.append(fallback_row.get(field))
-                            all_rows.append(canonical_row)
+                            # For IMAGE sources, collect rows for aggregation AFTER all pages
+                            if source_type == SourceType.IMAGE:
+                                image_rows_collector.append(canonical_row)
+                            else:
+                                all_rows.append(canonical_row)
                         else:
                             logger.debug(f"[Fallback] No data extracted from page {page_num} OCR text")
         
-        # For IMAGE sources, aggregate all collected rows into ONE vehicle
+        # For IMAGE sources, group rows by VIN and aggregate fields within each VIN group
+        # This handles both: (1) multiple complete vehicles (different VINs) and (2) partial rows for same vehicle
         if source_type == SourceType.IMAGE and image_rows_collector:
-            aggregated_vehicle = {field: None for field in canonical_schema}
+            # #region agent log
+            with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
+                f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H7","location":"sources.py:3833","message":"IMAGE: Starting aggregation","data":{"collector_size":len(image_rows_collector),"all_rows_size":len(all_rows)},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
+            # #endregion
+            
+            # Group rows by VIN (each unique VIN = one vehicle)
+            vin_index = canonical_schema.index('vin') if 'vin' in canonical_schema else 0
+            vin_groups = {}  # vin_upper -> list of rows for that VIN
+            
             for row in image_rows_collector:
-                for i, field in enumerate(canonical_schema):
-                    value = row[i] if i < len(row) else None
-                    # Merge: last non-null value wins (but skip invalid VINs like "YEAR")
-                    if value is not None and value != "":
-                        # Skip header tokens that might have been extracted as VINs
-                        if field == "vin" and str(value).upper() in {'YEAR', 'MAKE', 'MODEL', 'COLOR', 'MILEAGE', 'VIN'}:
-                            continue
-                        aggregated_vehicle[field] = value
-            # Convert aggregated vehicle to canonical row
-            # Only emit if we have a valid VIN (not a header token)
-            vin_value = aggregated_vehicle.get('vin')
-            if vin_value and str(vin_value).upper() not in {'YEAR', 'MAKE', 'MODEL', 'COLOR', 'MILEAGE', 'VIN'}:
-                canonical_row = []
-                for field in canonical_schema:
-                    value = aggregated_vehicle.get(field)
-                    if isinstance(value, str) and value.strip().lower() == "none":
-                        value = None
-                    canonical_row.append(value)
-                all_rows.append(canonical_row)
-            else:
-                logger.warning(f"[IMAGE] No valid VIN found after aggregation (got: {vin_value}), skipping row")
+                if len(row) <= vin_index:
+                    continue
+                vin_value = row[vin_index]
+                if not vin_value:
+                    continue
+                vin_upper_clean = str(vin_value).upper().strip().rstrip('.,;:!?')
+                # Skip header tokens
+                invalid_vin_tokens = {'YEAR', 'MAKE', 'MODEL', 'COLOR', 'MILEAGE', 'VIN', 
+                                      'BODY', 'PAINTED', 'GASOLINE', 'TRANSMISSION', 'NOTES',
+                                      'CURRENT', 'EXTERIOR', 'ADDITIONAL', 'DETAIL', 'SHEET',
+                                      'STYLE', 'TYPE', 'EMAIL', 'FUEL', 'BODY_STYLE', 'FUEL_TYPE'}
+                if vin_upper_clean in invalid_vin_tokens:
+                    continue
+                if vin_upper_clean not in vin_groups:
+                    vin_groups[vin_upper_clean] = []
+                vin_groups[vin_upper_clean].append(row)
+            
+            # For each VIN group, aggregate fields (merge partial rows into one complete vehicle)
+            for vin_upper, rows_for_vin in vin_groups.items():
+                aggregated_vehicle = {field: None for field in canonical_schema}
+                aggregated_is_handwritten = False
+                for row in rows_for_vin:
+                    for i, field in enumerate(canonical_schema):
+                        value = row[i] if i < len(row) else None
+                        # Merge: last non-null value wins
+                        if value is not None and value != "":
+                            aggregated_vehicle[field] = value
+                    # Preserve _is_handwritten from any row (if any row is handwritten, aggregated is handwritten)
+                    if len(row) > len(canonical_schema) and row[len(canonical_schema)]:
+                        aggregated_is_handwritten = True
+                
+                # Convert aggregated vehicle to canonical row
+                vin_value = aggregated_vehicle.get('vin')
+                # #region agent log
+                with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
+                    f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H3","location":"sources.py:4296","message":"Image aggregation: Checking aggregated VIN","data":{"vin_value":vin_value,"vin_type":type(vin_value).__name__ if vin_value else None,"collector_size":len(image_rows_collector) if image_rows_collector else 0,"rows_in_group":len(rows_for_vin)},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
+                # #endregion
+                if vin_value:
+                    # #region agent log
+                    with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
+                        f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H3","location":"sources.py:4305","message":"Image aggregation: Adding valid aggregated row","data":{"vin_value":vin_value},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
+                    # #endregion
+                    canonical_row = []
+                    for field in canonical_schema:
+                        value = aggregated_vehicle.get(field)
+                        if isinstance(value, str) and value.strip().lower() == "none":
+                            value = None
+                        canonical_row.append(value)
+                    # Preserve _is_handwritten flag
+                    canonical_row.append(aggregated_is_handwritten)
+                    all_rows.append(canonical_row)
+                else:
+                    logger.warning(f"[IMAGE] No valid VIN found after aggregation (got: {vin_value}), skipping row")
         
         # Log extraction summary
         if vision_extracted_pages:
@@ -3848,7 +5196,14 @@ def _extract_table_with_vision_api(
         
         if not all_rows:
             logger.warning("[Vision] No rows extracted from any page")
-            return None
+            # #region agent log
+            with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
+                f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H1","location":"sources.py:3898","message":"_extract_table_with_vision_api: No rows extracted","data":{"source_type":source_type.name,"image_rows_collector_size":len(image_rows_collector) if image_rows_collector else 0,"all_rows_size":len(all_rows)},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
+            # #endregion
+            # Return empty 2D array with headers to ensure normalize_v2 is called
+            # Include _is_handwritten and _is_vision_extracted in header to preserve them through rows2d_to_objects
+            header_row = list(canonical_schema) + ["_is_handwritten", "_is_vision_extracted"]
+            return [header_row]  # Return header row only, no data rows
         
         # Build 2D array: header row + data rows
         # Clean "None" strings from all rows before returning
@@ -3863,20 +5218,37 @@ def _extract_table_with_vision_api(
             cleaned_rows.append(cleaned_row)
         
         rows_2d = []
-        rows_2d.append(canonical_schema)  # Header row
+        # Include _is_handwritten and _is_vision_extracted in header to preserve them through rows2d_to_objects
+        # CRITICAL: Use canonical_schema field names directly (don't normalize) to ensure exact match in normalize_v2
+        header_row = list(canonical_schema) + ["_is_handwritten", "_is_vision_extracted"]
+        rows_2d.append(header_row)  # Header row
         rows_2d.extend(cleaned_rows)  # Data rows
         
         logger.info(f"[Vision] Final parsed 2D array: {len(cleaned_rows)} rows × {len(canonical_schema)} columns")
         logger.info(f"[Vision] Extraction success: {len(cleaned_rows)} rows × {len(canonical_schema)} columns")
+        # #region agent log
+        with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
+            f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H1","location":"sources.py:3942","message":"_extract_table_with_vision_api: Returning rows_2d","data":{"rows_count":len(cleaned_rows),"headers":canonical_schema[:10],"source_type":source_type.name},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
+        # #endregion
+        # Clear cached OCR text after extraction is complete
+        if hasattr(_extract_table_with_vision_api, '_cached_full_ocr_text'):
+            delattr(_extract_table_with_vision_api, '_cached_full_ocr_text')
         return rows_2d
         
     except ImportError as e:
         logger.error(f"[Vision] Required package not installed: {e}")
-        return None
+        # Return empty 2D array with headers to ensure normalize_v2 is called
+        from schema import VEHICLE_SCHEMA_ORDER
+        canonical_schema = VEHICLE_SCHEMA_ORDER.copy()
+        header_row = list(canonical_schema) + ["_is_handwritten"]
+        return [header_row]  # Return header row only, no data rows
     except Exception as e:
         logger.error(f"[Vision] Extraction failed: {e}", exc_info=True)
-        # Return None to fallback to OCR results instead of crashing
-        return None
+        # Return empty 2D array with headers to ensure normalize_v2 is called (not None to bypass normalization)
+        from schema import VEHICLE_SCHEMA_ORDER
+        canonical_schema = VEHICLE_SCHEMA_ORDER.copy()
+        header_row = list(canonical_schema) + ["_is_handwritten"]
+        return [header_row]  # Return header row only, no data rows
 
 
 def _extract_from_ocr_source(
@@ -4056,34 +5428,75 @@ def _extract_from_ocr_source(
                     logger.warning("[PDF] parse_claim_raw_text returned 0 claims")
                     return []
             else:
-                # Default to vehicle parser (backward compatibility)
-                logger.info("[PDF] Using parse_vehicle_raw_text for vehicles (default)")
+                # Default to vehicle parser - check if PDF is scanned/handwritten first
+                logger.info("[PDF] Using _extract_table_with_vision_api for vehicles (default)")
                 logger.warning(f"[DEBUG] ROUTING TO VEHICLE PARSER (default) - is_policy={is_policy}, is_driver={is_driver}, is_location={is_location}, domain_mapping_id=\'{domain_mapping_id}\'")
-                vehicles = parse_vehicle_raw_text(vision_ocr_text, source_type="pdf")
                 
-                # DEBUG: Only print if we didn't find 6 vehicles (success case)
-                if len(vehicles) < 6:
-                    print(f"[PDF DEBUG] OCR text preview (first 300 chars): {vision_ocr_text[:300]}")
-                    print(f"[PDF DEBUG] Number of VIN blocks found: {len(vehicles)}")
-                if vehicles:
-                    logger.info(f"[PDF] Extracted {len(vehicles)} vehicle(s) from Vision OCR text")
-                    # Convert to 2D array format
-                    from schema import VEHICLE_SCHEMA_ORDER
-                    canonical_schema = VEHICLE_SCHEMA_ORDER.copy()
-                    rows_2d = [canonical_schema]  # Header row
-                    for vehicle in vehicles:
-                        row = []
-                        for field in canonical_schema:
-                            value = vehicle.get(field)
-                            # Clean "None" strings
-                            if isinstance(value, str) and value.strip().lower() == "none":
-                                value = None
-                            row.append(value)
-                        rows_2d.append(row)
-                    return rows_2d
+                # Check if PDF is scanned or handwritten (no embedded text OR low OCR confidence)
+                is_scanned, scan_reason = _is_pdf_scanned_or_handwritten(file_path)
+                
+                if is_scanned:
+                    logger.info(f"[PDF] Detected scanned/handwritten PDF ({scan_reason}) - routing as IMAGE for better extraction")
+                    # Convert PDF pages to images and route as IMAGE source type
+                    # This forces image-first Vision extraction, skipping OCR-first and split_by_vin paths
+                    vision_result = _extract_table_with_vision_api(
+                        file_path,
+                        SourceType.IMAGE,  # Route as IMAGE to force image-first processing
+                        mapping_id=domain_mapping_id,
+                        **kwargs
+                    )
                 else:
-                    logger.warning("[PDF] parse_vehicle_raw_text returned 0 vehicles")
-                    return []
+                    # Structured PDF with embedded text - use existing PDF processing path
+                    # Use _extract_table_with_vision_api which uses extract_fields_from_block directly
+                    # This is more reliable than parse_vehicle_raw_text for PDFs
+                    # #region agent log
+                    with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
+                        f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H1","location":"sources.py:4113","message":"PDF: Calling _extract_table_with_vision_api","data":{"file_path":str(file_path),"mapping_id":domain_mapping_id},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
+                    # #endregion
+                    vision_result = _extract_table_with_vision_api(
+                        file_path,
+                        SourceType.PDF,
+                        mapping_id=domain_mapping_id,
+                        **kwargs
+                    )
+                # #region agent log
+                with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
+                    f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H1","location":"sources.py:4120","message":"PDF: _extract_table_with_vision_api result","data":{"result_is_none":vision_result is None,"result_length":len(vision_result) if vision_result else 0,"result_headers":vision_result[0] if vision_result and len(vision_result) > 0 else None},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
+                # #endregion
+                if vision_result and len(vision_result) > 1:  # Has header + at least one data row
+                    logger.info(f"[PDF] Extracted {len(vision_result)-1} vehicle(s) from Vision API (header row excluded)")
+                    return vision_result
+                else:
+                    # vision_result is None or empty (only header row) - fall back to parse_vehicle_raw_text
+                    logger.warning(f"[PDF] _extract_table_with_vision_api returned {'None' if vision_result is None else 'empty (only headers)'}, falling back to parse_vehicle_raw_text")
+                    # #region agent log
+                    with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
+                        f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H1","location":"sources.py:4123","message":"PDF: Falling back to parse_vehicle_raw_text","data":{"vision_ocr_text_length":len(vision_ocr_text) if vision_ocr_text else 0},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
+                    # #endregion
+                    # Fallback to parse_vehicle_raw_text if Vision API fails
+                    vehicles = parse_vehicle_raw_text(vision_ocr_text, source_type="pdf")
+                    if vehicles:
+                        logger.info(f"[PDF] Extracted {len(vehicles)} vehicle(s) from Vision OCR text (fallback)")
+                        # Convert to 2D array format
+                        from schema import VEHICLE_SCHEMA_ORDER
+                        canonical_schema = VEHICLE_SCHEMA_ORDER.copy()
+                        rows_2d = [canonical_schema]  # Header row
+                        for vehicle in vehicles:
+                            row = []
+                            for field in canonical_schema:
+                                value = vehicle.get(field)
+                                # Clean "None" strings
+                                if isinstance(value, str) and value.strip().lower() == "none":
+                                    value = None
+                                row.append(value)
+                            rows_2d.append(row)
+                        return rows_2d
+                    else:
+                        logger.warning("[PDF] parse_vehicle_raw_text returned 0 vehicles")
+                        # Return empty 2D array with headers to ensure normalize_v2 is called
+                        from schema import VEHICLE_SCHEMA_ORDER
+                        canonical_schema = VEHICLE_SCHEMA_ORDER.copy()
+                        return [canonical_schema]  # Return header row only, no data rows
         except Exception as e:
             logger.warning(f"[PDF] Vision OCR failed: {e}, falling back to regular OCR pipeline")
             logger.info(f"[DEBUG] Vision OCR exception: {type(e).__name__}: {str(e)}")
@@ -4211,9 +5624,21 @@ def _extract_from_ocr_source(
                                 logger.warning("[PDF] parse_claim_raw_text returned 0 claims (fallback OCR)")
                                 return []
                         else:
-                            # Default to vehicle parser
-                            vehicles = parse_vehicle_raw_text(full_ocr_text, source_type="pdf")
+                            # Default to vehicle parser - use _extract_table_with_vision_api which works correctly
                             logger.warning(f"[DEBUG] ROUTING TO VEHICLE PARSER (fallback OCR) - is_policy={is_policy}, is_driver={is_driver}, is_location={is_location}, domain_mapping_id=\'{domain_mapping_id}\'")
+                            # Try _extract_table_with_vision_api first (more reliable)
+                            vision_result = _extract_table_with_vision_api(
+                                file_path,
+                                SourceType.PDF,
+                                mapping_id=domain_mapping_id,
+                                **kwargs
+                            )
+                            if vision_result and len(vision_result) > 1:  # Has header + at least one data row
+                                logger.info(f"[PDF] Extracted {len(vision_result)-1} vehicle(s) from Vision API (fallback OCR path)")
+                                return vision_result
+                            # Fallback to parse_vehicle_raw_text if Vision API fails
+                            vehicles = parse_vehicle_raw_text(full_ocr_text, source_type="pdf")
+                            logger.warning(f"[PDF] Fallback: parse_vehicle_raw_text found {len(vehicles)} vehicles")
                             print(f"[PDF DEBUG] Number of VIN blocks found: {len(vehicles)}")
                             if vehicles:
                                 logger.info(f"[PDF] Extracted {len(vehicles)} vehicle(s) from regular OCR text")
@@ -4229,6 +5654,12 @@ def _extract_from_ocr_source(
                                         row.append(value)
                                     rows_2d.append(row)
                                 return rows_2d
+                            else:
+                                # No vehicles found - return empty 2D array with headers to ensure normalize_v2 is called
+                                logger.warning("[PDF] parse_vehicle_raw_text returned 0 vehicles (fallback OCR path)")
+                                from schema import VEHICLE_SCHEMA_ORDER
+                                canonical_schema = VEHICLE_SCHEMA_ORDER.copy()
+                                return [canonical_schema]  # Return header row only, no data rows
             except Exception as fallback_error:
                 logger.warning(f"[PDF] Regular OCR fallback also failed: {fallback_error}")
             # Fall through to regular OCR pipeline below
@@ -4612,11 +6043,19 @@ def _extract_from_ocr_source(
                             return rows_2d
                     else:
                         # Default to vehicle parser (backward compatibility)
+                        # Pre-split extraction: Extract document-level defaults for handwritten PDFs
+                        document_defaults = _extract_document_level_defaults(full_ocr_text, "pdf", file_path)
                         blocks = split_by_vin(full_ocr_text)
                         from mappings import get_mapping_by_id
                         mapping_config = get_mapping_by_id("source_pdf_vehicles")
                         
                         rows = [extract_fields_from_block(b, mapping=mapping_config, source_type="pdf") for b in blocks]
+                        # Apply document-level defaults to each vehicle if field is still None
+                        for vehicle in rows:
+                            if vehicle:
+                                for field in ['body_style', 'fuel_type', 'transmission', 'mileage']:
+                                    if vehicle.get(field) is None and document_defaults.get(field) is not None:
+                                        vehicle[field] = document_defaults[field]
                         pdf_vehicles = [r for r in rows if r and r.get('vin')]
                         
                         if pdf_vehicles:
@@ -4644,11 +6083,15 @@ def _extract_from_ocr_source(
             page_text_blocks=page_text_blocks if page_text_blocks else None,
             mapping_id=mapping_id
         )
-        if vision_result:
+        if vision_result and len(vision_result) > 1:  # Has header + at least one data row
             logger.info("[Vision] Fallback succeeded, using Vision results")
             return vision_result
-        logger.warning("[Vision] Fallback failed, returning empty result")
-        return []
+        # vision_result is None or empty (only header row) - return empty 2D array with headers
+        logger.warning(f"[Vision] Fallback {'failed' if vision_result is None else 'returned empty (only headers)'}, returning empty result with headers")
+        # Return empty 2D array with headers to ensure normalize_v2 is called
+        from schema import VEHICLE_SCHEMA_ORDER
+        canonical_schema = VEHICLE_SCHEMA_ORDER.copy()
+        return [canonical_schema]  # Return header row only, no data rows
     
     # Get all unique keys from all rows (columns)
     all_keys = set()
@@ -4662,14 +6105,54 @@ def _extract_from_ocr_source(
     cleaned_headers = [clean_header(key) for key in sorted_keys]
     rows_2d.append(cleaned_headers)
     
+    # #region agent log
+    if source_type == SourceType.IMAGE:
+        with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
+            f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H4","location":"sources.py:5283","message":"Table extraction: Processing ocr_result.rows","data":{"ocr_result_rows_count":len(ocr_result.rows),"sorted_keys":sorted_keys[:10],"first_row_keys":list(ocr_result.rows[0].keys())[:10] if ocr_result.rows else [],"first_row_vin":ocr_result.rows[0].get('vin') if ocr_result.rows and 'vin' in ocr_result.rows[0] else None},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
+    # #endregion
+    
+    # SAFEGUARD: Filter out header rows for IMAGE sources
     # Data rows
+    invalid_vin_tokens = {'YEAR', 'MAKE', 'MODEL', 'COLOR', 'MILEAGE', 'VIN', 'TRANSMISSION', 
+                          'BODY_STYLE', 'FUEL_TYPE', 'OWNER_EMAIL', 'NOTES', 'VEHICLE_ID', 
+                          'EFFECTIVE_DATE', 'TRIM', 'WEIGHT', 'BODY', 'PAINTED', 'GASOLINE',
+                          'CURRENT', 'EXTERIOR', 'ADDITIONAL', 'DETAIL', 'SHEET', 'STYLE',
+                          'TYPE', 'EMAIL', 'FUEL', 'BODY_TYPE', 'CURRENT_MILEAGE',
+                          'EXTERIOR_COLOR'}
+    
     for row_dict in ocr_result.rows:
+        # #region agent log
+        if source_type == SourceType.IMAGE:
+            with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
+                vin_value = row_dict.get('vin') or row_dict.get('VIN') or row_dict.get('VIN Number')
+                f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H4","location":"sources.py:5294","message":"Table extraction: Checking row","data":{"vin_value":vin_value,"vin_type":type(vin_value).__name__ if vin_value else None,"row_keys":list(row_dict.keys())[:10]},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
+        # #endregion
+        
+        # SAFEGUARD: For IMAGE sources, filter out rows where VIN is a header token
+        if source_type == SourceType.IMAGE:
+            # Try multiple possible VIN key names (case variations)
+            vin_value = row_dict.get('vin') or row_dict.get('VIN') or row_dict.get('VIN Number') or row_dict.get('vin_number')
+            if vin_value:
+                vin_upper_clean = str(vin_value).upper().strip().rstrip('.,;:!?')
+                if vin_upper_clean in invalid_vin_tokens:
+                    logger.warning(f"[IMAGE Table Extraction] Filtering row with invalid VIN (header token): {vin_value} -> {vin_upper_clean}")
+                    # #region agent log
+                    with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
+                        f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H4","location":"sources.py:5307","message":"Table extraction: Filtered invalid VIN","data":{"vin_value":vin_value,"vin_upper_clean":vin_upper_clean},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
+                    # #endregion
+                    continue  # Skip this row - it's a header row
+        
         row_values = []
         for key in sorted_keys:
             value = row_dict.get(key, "")
             # Convert to string for consistency
             row_values.append(str(value) if value is not None else "")
         rows_2d.append(row_values)
+        # #region agent log
+        if source_type == SourceType.IMAGE:
+            with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
+                f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H4","location":"sources.py:5315","message":"Table extraction: Added row to rows_2d","data":{"vin_value":vin_value if source_type == SourceType.IMAGE else None,"rows_2d_length":len(rows_2d)},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
+        # #endregion
     
     # Check if OCR result is unusable
     is_unusable, reason = _is_ocr_result_unusable(rows_2d)
@@ -4742,28 +6225,42 @@ def _extract_from_ocr_source(
                             return rows_2d
                     else:
                         # Default to vehicle parser (backward compatibility)
+                        # Pre-split extraction: Extract document-level defaults for handwritten PDFs
+                        document_defaults = _extract_document_level_defaults(full_ocr_text, "pdf", file_path)
                         blocks = split_by_vin(full_ocr_text)
                         from mappings import get_mapping_by_id
                         mapping_config = get_mapping_by_id("source_pdf_vehicles")
                         
                         rows = [extract_fields_from_block(b, mapping=mapping_config, source_type="pdf") for b in blocks]
+                        # Apply document-level defaults to each vehicle if field is still None
+                        for vehicle in rows:
+                            if vehicle:
+                                for field in ['body_style', 'fuel_type', 'transmission', 'mileage']:
+                                    if vehicle.get(field) is None and document_defaults.get(field) is not None:
+                                        vehicle[field] = document_defaults[field]
                         pdf_vehicles = [r for r in rows if r and r.get('vin')]
                         
                         if pdf_vehicles:
                             logger.info(f"[PDF] Extracted {len(pdf_vehicles)} vehicle(s) from text blocks (OCR unusable fallback)")
                             from schema import VEHICLE_SCHEMA_ORDER
                             canonical_schema = VEHICLE_SCHEMA_ORDER.copy()
-                        rows_2d_text = [canonical_schema]  # Header row
-                        for vehicle in pdf_vehicles:
-                            row = []
-                            for field in canonical_schema:
-                                value = vehicle.get(field)
-                                # Clean "None" strings
-                                if isinstance(value, str) and value.strip().lower() == "none":
-                                    value = None
-                                row.append(value)
-                            rows_2d_text.append(row)
-                        return rows_2d_text
+                            rows_2d_text = [canonical_schema]  # Header row
+                            for vehicle in pdf_vehicles:
+                                row = []
+                                for field in canonical_schema:
+                                    value = vehicle.get(field)
+                                    # Clean "None" strings
+                                    if isinstance(value, str) and value.strip().lower() == "none":
+                                        value = None
+                                    row.append(value)
+                                rows_2d_text.append(row)
+                            return rows_2d_text
+                        else:
+                            # No vehicles found - return empty 2D array with headers to ensure normalize_v2 is called
+                            logger.warning("[PDF] No vehicles extracted from text blocks (OCR unusable fallback)")
+                            from schema import VEHICLE_SCHEMA_ORDER
+                            canonical_schema = VEHICLE_SCHEMA_ORDER.copy()
+                            return [canonical_schema]  # Return header row only, no data rows
             except Exception as e:
                 logger.debug(f"[PDF] Text extraction fallback failed: {e}")
         
@@ -4775,10 +6272,21 @@ def _extract_from_ocr_source(
             page_text_blocks=page_text_blocks if page_text_blocks else None,
             mapping_id=mapping_id
         )
-        if vision_result:
+        if vision_result and len(vision_result) > 1:  # Has header + at least one data row
             logger.info("[Vision] Fallback succeeded, using Vision results")
-            logger.warning("[Vision] Fallback failed, returning OCR results")
-            return rows_2d
+            return vision_result
+        else:
+            # vision_result is None or empty (only header row) - return OCR results (which should have headers)
+            logger.warning(f"[Vision] Fallback {'failed' if vision_result is None else 'returned empty (only headers)'}, returning OCR results")
+            # Ensure rows_2d has headers (should already have them from OCR extraction)
+            if rows_2d and len(rows_2d) > 0:
+                return rows_2d
+            else:
+                # OCR also failed - return empty 2D array with headers to ensure normalize_v2 is called
+                from schema import VEHICLE_SCHEMA_ORDER
+                canonical_schema = VEHICLE_SCHEMA_ORDER.copy()
+                header_row = list(canonical_schema) + ["_is_handwritten"]
+                return [header_row]  # Return header row only, no data rows
     
     # OCR result is usable
     logger.debug(f"[OCR] OCR extraction successful: {len(rows_2d)-1} data rows × {len(cleaned_headers)} columns")

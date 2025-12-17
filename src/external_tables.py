@@ -144,6 +144,13 @@ def rows2d_to_objects(values, header_row_index=0):
         for i, header in enumerate(headers):
             value = row[i] if i < len(row) else None
             obj[header] = value
+        # #region agent log
+        if obj.get('vin') == 'ST420RJ98FDHKL4E':
+            import json
+            from datetime import datetime
+            with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
+                f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H2","location":"external_tables.py:146","message":"PDF Row 6: After rows2d_to_objects","data":{"vin":obj.get('vin'),"year":obj.get('year'),"make":obj.get('make'),"model":obj.get('model'),"color":obj.get('color'),"owner_email":obj.get('owner_email'),"transmission":obj.get('transmission'),"headers":headers[:5]},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
+        # #endregion
         objects.append(obj)
     
     return objects

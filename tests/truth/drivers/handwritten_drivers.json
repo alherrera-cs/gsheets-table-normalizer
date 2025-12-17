@@ -1,0 +1,59 @@
+{
+    "__schema__": [
+      "driver_id",
+      "first_name",
+      "last_name",
+      "date_of_birth",
+      "license_number",
+      "license_state",
+      "license_status",
+      "years_experience",
+      "violations_count",
+      "training_completed",
+      "notes"
+    ],
+    "rows": [
+      {
+        "driver_id": "D001",
+        "first_name": "Jessica",
+        "last_name": "Cook",
+        "date_of_birth": "2020-03-27",
+        "license_number": "A1234567",
+        "license_state": "CA",
+        "license_status": null,
+        "years_experience": null,
+        "violations_count": null,
+        "training_completed": null,
+        "notes": "Handwritten driver record.",
+        "_warnings": ["invalid_email"]
+      },
+      {
+        "driver_id": "D002",
+        "first_name": "Paige",
+        "last_name": "Cook",
+        "date_of_birth": "1957",
+        "license_number": "B236177",
+        "license_state": "CA",
+        "license_status": null,
+        "years_experience": null,
+        "violations_count": null,
+        "training_completed": null,
+        "notes": "Handwritten driver record.",
+        "_warnings": ["incomplete_dob"]
+      },
+      {
+        "driver_id": "D003",
+        "first_name": "Drew",
+        "last_name": "Spark",
+        "date_of_birth": "1987-02-22",
+        "license_number": "C733197",
+        "license_state": "CA",
+        "license_status": null,
+        "years_experience": null,
+        "violations_count": null,
+        "training_completed": null,
+        "notes": "Handwritten driver record.",
+        "_warnings": ["invalid_email"]
+      }
+    ]
+  }

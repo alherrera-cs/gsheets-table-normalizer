@@ -1191,6 +1191,304 @@ def test_image() -> Tuple[bool, int, int]:
         return False, 0, 0
 
 
+def test_handwritten_pdf() -> Tuple[bool, int, int]:
+    """Test handwritten PDF driver documents."""
+    # Initialize passed at the top
+    passed = True
+    
+    print(f"{Colors.BOLD}{Colors.CYAN}{'='*80}{Colors.RESET}")
+    print(f"{Colors.BOLD}{Colors.CYAN}=== Testing Handwritten PDF Driver Documents ==={Colors.RESET}")
+    print(f"{Colors.BOLD}{Colors.CYAN}{'='*80}{Colors.RESET}\n")
+    
+    pdf_path = ROOT / "tests" / "drivers" / "unstructured" / "handwritten_pdf_drivers.pdf"
+    truth_file = ROOT / "tests" / "truth" / "drivers" / "handwritten_drivers.json"
+    mapping_id = "source_pdf_drivers"
+    
+    try:
+        # Load truth file
+        print(f"{Colors.BLUE}DEBUG: Loading truth file from: {truth_file.resolve()}{Colors.RESET}")
+        print(f"{Colors.BLUE}DEBUG: Truth file exists: {truth_file.exists()}{Colors.RESET}")
+        expected_rows = load_truth_file(truth_file)
+        print(f"{Colors.BLUE}DEBUG: Loaded {len(expected_rows)} expected rows from truth file{Colors.RESET}")
+        
+        # Get mapping
+        mapping_config = get_mapping_by_id(mapping_id)
+        if not mapping_config:
+            print(f"{Colors.RED}✗ Mapping not found: {mapping_id}{Colors.RESET}\n")
+            return False, 0, 0
+        
+        # Run normalize_v2
+        try:
+            result = normalize_v2(
+                source=str(pdf_path),
+                mapping_config=mapping_config,
+                header_row_index=0,
+                validate=False
+            )
+            actual_rows = result.get("data", [])
+            # Reorder to match schema
+            actual_rows = reorder_all_drivers(actual_rows)
+        except Exception as e:
+            print(f"{Colors.RED}ERROR during normalize_v2: {e}{Colors.RESET}")
+            traceback.print_exc()
+            return False, 0, 0
+        
+        print(f"{Colors.GREEN}✓{Colors.RESET} Rows extracted: {len(actual_rows)}")
+        
+        # Sort both expected and actual by driver_id for consistent comparison
+        expected_rows_sorted = sorted(expected_rows, key=lambda x: str(x.get("driver_id", "")))
+        actual_rows_sorted = sorted(actual_rows, key=lambda x: str(x.get("driver_id", "")))
+        
+        # Compare
+        print(f"\nComparing expected vs actual...")
+        comparison = compare_expected_vs_actual(expected_rows_sorted, actual_rows_sorted)
+        total_mismatched = comparison.get("total_mismatched_fields", 0)
+        passed = len(comparison["matched_rows"]) == len(expected_rows) and total_mismatched == 0
+        
+        # Normalize rows for display (already sorted)
+        expected_norm = [normalize_row_for_comparison(row) for row in expected_rows_sorted]
+        actual_norm = [normalize_row_for_comparison(row) for row in actual_rows_sorted]
+        
+        # Print results (same structure as test_airtable)
+        print()
+        print("=" * 80)
+        print("COMPARISON RESULTS")
+        print("=" * 80)
+        print()
+        
+        # Group mismatches by row
+        mismatches_by_row = {}
+        extra_rows = []
+        missing_rows = []
+        
+        for mismatch in comparison["mismatches"]:
+            row_num = mismatch["row"]
+            mismatch_type = mismatch.get("type")
+            
+            if mismatch_type == "extra_row":
+                extra_rows.append(row_num)
+            elif mismatch_type == "missing_row":
+                missing_rows.append(row_num)
+            else:
+                if row_num not in mismatches_by_row:
+                    mismatches_by_row[row_num] = []
+                mismatches_by_row[row_num].append(mismatch)
+        
+        # Print row diffs and track rows with warnings
+        total_rows = max(len(expected_norm), len(actual_norm))
+        rows_with_warnings = []
+        for row_idx in range(total_rows):
+            row_num = row_idx + 1
+            
+            # Handle extra/missing rows
+            if row_num in extra_rows:
+                print(f"*** Expected row {row_num} has no actual row ***")
+                print()
+                continue
+            
+            if row_num in missing_rows:
+                print(f"*** Actual row {row_num} has no expected row ***")
+                print()
+                continue
+            
+            # Skip if row doesn't exist in either
+            if row_idx >= len(expected_norm) or row_idx >= len(actual_norm):
+                continue
+            
+            expected_row = expected_norm[row_idx]
+            actual_row = actual_norm[row_idx]
+            
+            # Track rows with warnings
+            actual_warnings = actual_row.get("_warnings", [])
+            if actual_warnings and len(actual_warnings) > 0:
+                rows_with_warnings.append(row_num)
+            
+            # Print diff for this row
+            num_mismatches = print_row_diff(row_num, expected_row, actual_row)
+            
+            # If perfect match, already printed by print_row_diff
+            if num_mismatches == 0:
+                continue
+        
+        # Print summary
+        print()
+        print("=" * 80)
+        print("SUMMARY")
+        print("-" * 80)
+        print(f"Total expected rows: {len(expected_rows_sorted)}")
+        print(f"Total actual rows:   {len(actual_rows_sorted)}")
+        print(f"Perfect matches:     {len(comparison['matched_rows'])}")
+        print(f"Rows with mismatches: {len(comparison['mismatched_rows'])}")
+        print(f"Total mismatched fields: {comparison.get('total_mismatched_fields', 0)}")
+        if rows_with_warnings:
+            print(f"Rows containing warnings: {', '.join(map(str, rows_with_warnings))}")
+        else:
+            print("Rows containing warnings: None")
+        print()
+        
+        # Print final pass/fail
+        if passed:
+            print(f"{Colors.GREEN}{Colors.BOLD}✓ PASS{Colors.RESET}\n")
+        else:
+            print(f"{Colors.RED}{Colors.BOLD}✗ FAIL{Colors.RESET} - {len(comparison['mismatched_rows'])} row(s) with mismatches, {total_mismatched} mismatched field(s)\n")
+        
+        return passed, len(actual_rows), total_mismatched
+        
+    except Exception as e:
+        print(f"{Colors.RED}✗ ERROR: {e}{Colors.RESET}\n")
+        traceback.print_exc()
+        return False, 0, 0
+
+
+def test_handwritten_image() -> Tuple[bool, int, int]:
+    """Test handwritten image driver data."""
+    # Initialize passed at the top
+    passed = True
+    
+    print(f"{Colors.BOLD}{Colors.CYAN}{'='*80}{Colors.RESET}")
+    print(f"{Colors.BOLD}{Colors.CYAN}=== Testing Handwritten Image Driver Data ==={Colors.RESET}")
+    print(f"{Colors.BOLD}{Colors.CYAN}{'='*80}{Colors.RESET}\n")
+    
+    img_path = ROOT / "tests" / "drivers" / "unstructured" / "handwritten_jpeg_drivers.jpg"
+    truth_file = ROOT / "tests" / "truth" / "drivers" / "handwritten_drivers.json"
+    mapping_id = "source_image_drivers"
+    
+    try:
+        # Load truth file
+        print(f"{Colors.BLUE}DEBUG: Loading truth file from: {truth_file.resolve()}{Colors.RESET}")
+        print(f"{Colors.BLUE}DEBUG: Truth file exists: {truth_file.exists()}{Colors.RESET}")
+        expected_rows = load_truth_file(truth_file)
+        print(f"{Colors.BLUE}DEBUG: Loaded {len(expected_rows)} expected rows from truth file{Colors.RESET}")
+        
+        # Get mapping
+        mapping_config = get_mapping_by_id(mapping_id)
+        if not mapping_config:
+            print(f"{Colors.RED}✗ Mapping not found: {mapping_id}{Colors.RESET}\n")
+            return False, 0, 0
+        
+        # Run normalize_v2
+        try:
+            result = normalize_v2(
+                source=str(img_path),
+                mapping_config=mapping_config,
+                header_row_index=0,
+                validate=False
+            )
+            actual_rows = result.get("data", [])
+            # Reorder to match schema
+            actual_rows = reorder_all_drivers(actual_rows)
+        except Exception as e:
+            print(f"{Colors.RED}ERROR during normalize_v2: {e}{Colors.RESET}")
+            traceback.print_exc()
+            return False, 0, 0
+        
+        print(f"{Colors.GREEN}✓{Colors.RESET} Rows extracted: {len(actual_rows)}")
+        
+        # Sort both expected and actual by driver_id for consistent comparison
+        expected_rows_sorted = sorted(expected_rows, key=lambda x: str(x.get("driver_id", "")))
+        actual_rows_sorted = sorted(actual_rows, key=lambda x: str(x.get("driver_id", "")))
+        
+        # Compare
+        print(f"\nComparing expected vs actual...")
+        comparison = compare_expected_vs_actual(expected_rows_sorted, actual_rows_sorted)
+        total_mismatched = comparison.get("total_mismatched_fields", 0)
+        passed = len(comparison["matched_rows"]) == len(expected_rows) and total_mismatched == 0
+        
+        # Normalize rows for display (already sorted)
+        expected_norm = [normalize_row_for_comparison(row) for row in expected_rows_sorted]
+        actual_norm = [normalize_row_for_comparison(row) for row in actual_rows_sorted]
+        
+        # Print results (same structure as test_airtable)
+        print()
+        print("=" * 80)
+        print("COMPARISON RESULTS")
+        print("=" * 80)
+        print()
+        
+        # Group mismatches by row
+        mismatches_by_row = {}
+        extra_rows = []
+        missing_rows = []
+        
+        for mismatch in comparison["mismatches"]:
+            row_num = mismatch["row"]
+            mismatch_type = mismatch.get("type")
+            
+            if mismatch_type == "extra_row":
+                extra_rows.append(row_num)
+            elif mismatch_type == "missing_row":
+                missing_rows.append(row_num)
+            else:
+                if row_num not in mismatches_by_row:
+                    mismatches_by_row[row_num] = []
+                mismatches_by_row[row_num].append(mismatch)
+        
+        # Print row diffs and track rows with warnings
+        total_rows = max(len(expected_norm), len(actual_norm))
+        rows_with_warnings = []
+        for row_idx in range(total_rows):
+            row_num = row_idx + 1
+            
+            # Handle extra/missing rows
+            if row_num in extra_rows:
+                print(f"*** Expected row {row_num} has no actual row ***")
+                print()
+                continue
+            
+            if row_num in missing_rows:
+                print(f"*** Actual row {row_num} has no expected row ***")
+                print()
+                continue
+            
+            # Skip if row doesn't exist in either
+            if row_idx >= len(expected_norm) or row_idx >= len(actual_norm):
+                continue
+            
+            expected_row = expected_norm[row_idx]
+            actual_row = actual_norm[row_idx]
+            
+            # Track rows with warnings
+            actual_warnings = actual_row.get("_warnings", [])
+            if actual_warnings and len(actual_warnings) > 0:
+                rows_with_warnings.append(row_num)
+            
+            # Print diff for this row
+            num_mismatches = print_row_diff(row_num, expected_row, actual_row)
+            
+            # If perfect match, already printed by print_row_diff
+            if num_mismatches == 0:
+                continue
+        
+        # Print summary
+        print()
+        print("=" * 80)
+        print("SUMMARY")
+        print("-" * 80)
+        print(f"Total expected rows: {len(expected_rows_sorted)}")
+        print(f"Total actual rows:   {len(actual_rows_sorted)}")
+        print(f"Perfect matches:     {len(comparison['matched_rows'])}")
+        print(f"Rows with mismatches: {len(comparison['mismatched_rows'])}")
+        print(f"Total mismatched fields: {comparison.get('total_mismatched_fields', 0)}")
+        if rows_with_warnings:
+            print(f"Rows containing warnings: {', '.join(map(str, rows_with_warnings))}")
+        else:
+            print("Rows containing warnings: None")
+        print()
+        
+        # Print final pass/fail
+        if passed:
+            print(f"{Colors.GREEN}{Colors.BOLD}✓ PASS{Colors.RESET}\n")
+        else:
+            print(f"{Colors.RED}{Colors.BOLD}✗ FAIL{Colors.RESET} - {len(comparison['mismatched_rows'])} row(s) with mismatches, {total_mismatched} mismatched field(s)\n")
+        
+        return passed, len(actual_rows), total_mismatched
+        
+    except Exception as e:
+        print(f"{Colors.RED}✗ ERROR: {e}{Colors.RESET}\n")
+        traceback.print_exc()
+        return False, 0, 0
+
+
 def main():
     """Run all driver tests."""
     print("=" * 80)
@@ -1207,6 +1505,8 @@ def main():
     results.append(("Raw Text", test_raw_text()))
     results.append(("PDF", test_pdf()))
     results.append(("Image", test_image()))
+    results.append(("Handwritten PDF", test_handwritten_pdf()))
+    results.append(("Handwritten Image", test_handwritten_image()))
     
     # Print final summary
     print("=" * 80)

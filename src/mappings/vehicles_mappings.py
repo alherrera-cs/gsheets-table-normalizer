@@ -646,7 +646,7 @@ VEHICLES_MAPPINGS = [
                 "source_field": "",
                 "type": "string",
                 "required": False,
-                "ai_instruction": "Extract ONLY the vehicle-specific notes.\n\nRULES:\n- Keep each sentence EXACTLY once\n- Remove bullets ('-', '*', '•') and list format\n- Keep original ordering\n- No duplication\n- Output a clean paragraph, not a list"
+                "ai_instruction": "Extract the notes field EXACTLY as written in the source document.\n\nCRITICAL RULES:\n- Copy notes VERBATIM - word-for-word, character-for-character\n- Preserve original wording, punctuation, sentence order, and capitalization\n- Do NOT summarize, paraphrase, rewrite, or reorder sentences\n- Do NOT remove content unless it's clearly not vehicle-specific\n- Do NOT add explanatory text or infer missing information\n- If notes contain bullets ('-', '*', '•') or list markers, preserve them as written\n- If no notes are present in the source, set notes = null (not empty string)\n- Keep each sentence EXACTLY once - no duplication\n- Output the notes exactly as they appear in the source, preserving original formatting"
             },
             {
                 "target_field": "vehicle_id",
@@ -809,7 +809,7 @@ VEHICLES_MAPPINGS = [
                 "source_field": "",
                 "type": "string",
                 "required": False,
-                "ai_instruction": "Extract the descriptive text ONLY for THIS vehicle.\n- Ignore all example blocks\n- Ignore template text\n- Do NOT copy text from previous vehicles\n- Produce one clean narrative sentence"
+                "ai_instruction": "Extract the notes field EXACTLY as written in the source document for THIS vehicle only.\n\nCRITICAL RULES:\n- Copy notes VERBATIM - word-for-word, character-for-character\n- Preserve original wording, punctuation, sentence order, and capitalization\n- Do NOT summarize, paraphrase, rewrite, or reorder sentences\n- Do NOT add explanatory text or infer missing information\n- Ignore all example blocks and template text\n- Do NOT copy text from previous vehicles\n- If no notes are present in the source, set notes = null (not empty string)\n- If notes exist, extract them exactly as written - preserve original formatting"
             },
             {
                 "target_field": "color",

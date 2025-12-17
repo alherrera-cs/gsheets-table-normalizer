@@ -1,0 +1,78 @@
+{
+    "__schema__": [
+      "vin",
+      "vehicle_id",
+      "year",
+      "make",
+      "model",
+      "effective_date",
+      "notes",
+      "color",
+      "mileage",
+      "trim",
+      "body_style",
+      "fuel_type",
+      "transmission",
+      "owner_email",
+      "weight"
+    ],
+    "rows": [
+      {
+        "vin": "HBUSRJGF4CBFPR9BN",
+        "vehicle_id": null,
+        "year": 2024,
+        "make": "Toyota",
+        "model": "Camry",
+        "effective_date": null,
+        "notes": null,
+        "color": "Blue",
+        "mileage": 100245,
+        "trim": null,
+        "body_style": "sedan",
+        "fuel_type": "gasoline",
+        "transmission": "automatic",
+        "owner_email": null,
+        "weight": null,
+        "_warnings": []
+      },
+      {
+        "vin": "3R5UAL4YUKPYGF1GZ",
+        "vehicle_id": null,
+        "year": 2020,
+        "make": "Ford",
+        "model": "F-150",
+        "effective_date": null,
+        "notes": null,
+        "color": "Red",
+        "mileage": 89000,
+        "trim": null,
+        "body_style": "truck",
+        "fuel_type": "gasoline",
+        "transmission": "automatic",
+        "owner_email": null,
+        "weight": null,
+        "_warnings": []
+      },
+      {
+        "vin": "ST420RJ98FDHKL4E",
+        "vehicle_id": null,
+        "year": 1989,
+        "make": "Nissan",
+        "model": "Altima",
+        "effective_date": null,
+        "notes": null,
+        "color": "Green",
+        "mileage": -450,
+        "trim": null,
+        "body_style": "sedan",
+        "fuel_type": "gasoline",
+        "transmission": "automatic",
+        "owner_email": null,
+        "weight": null,
+        "_warnings": [
+          "invalid_year",
+          "negative_mileage"
+        ]
+      }
+    ]
+  }

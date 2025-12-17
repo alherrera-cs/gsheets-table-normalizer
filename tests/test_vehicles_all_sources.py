@@ -1441,6 +1441,310 @@ def test_png() -> Tuple[bool, int, int]:
         return False, 0, 0
 
 
+def test_handwritten_pdf() -> Tuple[bool, int, int]:
+    """Test handwritten PDF vehicle documents."""
+    # Initialize passed at the top
+    passed = True
+    
+    print(f"{Colors.BOLD}{Colors.CYAN}{'='*80}{Colors.RESET}")
+    print(f"{Colors.BOLD}{Colors.CYAN}=== Testing Handwritten PDF Vehicle Documents ==={Colors.RESET}")
+    print(f"{Colors.BOLD}{Colors.CYAN}{'='*80}{Colors.RESET}\n")
+    
+    pdf_path = ROOT / "tests" / "vehicles" / "unstructured" / "handwritten_pdf_vehicles.pdf"
+    truth_file = ROOT / "tests" / "truth" / "vehicles" / "handwritten_vehicles.json"
+    mapping_id = "source_pdf_vehicles"
+    
+    try:
+        # Load truth file
+        print(f"{Colors.BLUE}DEBUG: Loading truth file from: {truth_file.resolve()}{Colors.RESET}")
+        print(f"{Colors.BLUE}DEBUG: Truth file exists: {truth_file.exists()}{Colors.RESET}")
+        expected_rows = load_truth_file(truth_file)
+        print(f"{Colors.BLUE}DEBUG: Loaded {len(expected_rows)} expected rows from truth file{Colors.RESET}")
+        
+        # Get mapping
+        mapping_config = get_mapping_by_id(mapping_id)
+        if not mapping_config:
+            print(f"{Colors.RED}✗ Mapping not found: {mapping_id}{Colors.RESET}\n")
+            return False, 0, 0
+        
+        # Run normalize_v2
+        try:
+            result = normalize_v2(
+                source=str(pdf_path),
+                mapping_config=mapping_config,
+                header_row_index=0,
+                validate=False
+            )
+            actual_rows = result.get("data", [])
+        except Exception as e:
+            print(f"{Colors.RED}ERROR during normalize_v2: {e}{Colors.RESET}")
+            traceback.print_exc()
+            return False, 0, 0
+        
+        print(f"{Colors.GREEN}✓{Colors.RESET} Rows extracted: {len(actual_rows)}")
+        
+        # Compare
+        print(f"Comparing expected vs actual...")
+        comparison = compare_expected_vs_actual(expected_rows, actual_rows)
+        total_mismatched = comparison.get("total_mismatched_fields", 0)
+        passed = len(comparison["matched_rows"]) == len(expected_rows) and total_mismatched == 0
+        
+        # Normalize rows for display
+        expected_norm = [normalize_row_for_comparison(row) for row in expected_rows]
+        actual_norm = [normalize_row_for_comparison(row) for row in actual_rows]
+        
+        # Print results with clean header
+        print()
+        print(f"{Colors.BOLD}{'─' * 80}{Colors.RESET}")
+        print(f"{Colors.BOLD}COMPARISON RESULTS{Colors.RESET}")
+        print(f"{Colors.BOLD}{'─' * 80}{Colors.RESET}")
+        print()
+        
+        # Group mismatches by row
+        mismatches_by_row = {}
+        extra_rows = []
+        missing_rows = []
+        
+        for mismatch in comparison["mismatches"]:
+            row_num = mismatch["row"]
+            mismatch_type = mismatch.get("type")
+            
+            if mismatch_type == "extra_row":
+                extra_rows.append(row_num)
+            elif mismatch_type == "missing_row":
+                missing_rows.append(row_num)
+            else:
+                if row_num not in mismatches_by_row:
+                    mismatches_by_row[row_num] = []
+                mismatches_by_row[row_num].append(mismatch)
+        
+        # Print row diffs and track rows with warnings
+        total_rows = max(len(expected_norm), len(actual_norm))
+        rows_with_warnings = []
+        for row_idx in range(total_rows):
+            row_num = row_idx + 1
+            
+            # Handle extra/missing rows
+            if row_num in extra_rows:
+                print(f"*** Expected row {row_num} has no actual row ***")
+                print()
+                continue
+            
+            if row_num in missing_rows:
+                print(f"*** Actual row {row_num} has no expected row ***")
+                print()
+                continue
+            
+            # Skip if row doesn't exist in either
+            if row_idx >= len(expected_norm) or row_idx >= len(actual_norm):
+                continue
+            
+            expected_row = expected_norm[row_idx]
+            actual_row = actual_norm[row_idx]
+            
+            # Track rows with warnings
+            actual_warnings = actual_row.get("_warnings", [])
+            if actual_warnings and len(actual_warnings) > 0:
+                rows_with_warnings.append(row_num)
+            
+            # Print diff for this row
+            num_mismatches = print_row_diff(row_num, expected_row, actual_row)
+            
+            # If perfect match, already printed by print_row_diff
+            if num_mismatches == 0:
+                continue
+        
+        # Print professional summary
+        print()
+        print(f"{Colors.BOLD}{'=' * 80}{Colors.RESET}")
+        print(f"{Colors.BOLD}SUMMARY{Colors.RESET}")
+        print(f"{Colors.BOLD}{'=' * 80}{Colors.RESET}")
+        
+        # Use a clean table format for summary
+        total_expected = len(expected_rows)
+        total_actual = len(actual_rows)
+        perfect_matches = len(comparison['matched_rows'])
+        mismatched_rows = len(comparison['mismatched_rows'])
+        total_mismatched_fields = comparison.get('total_mismatched_fields', 0)
+        
+        print(f"  {Colors.BOLD}Rows:{Colors.RESET}        Expected: {total_expected:<4} | Actual: {total_actual:<4}")
+        print(f"  {Colors.BOLD}Matches:{Colors.RESET}     Perfect: {Colors.GREEN}{perfect_matches:<4}{Colors.RESET} | Mismatched: {Colors.RED}{mismatched_rows:<4}{Colors.RESET}")
+        print(f"  {Colors.BOLD}Fields:{Colors.RESET}      Total mismatches: {Colors.RED}{total_mismatched_fields}{Colors.RESET}")
+        
+        if rows_with_warnings:
+            warning_rows_str = ", ".join(map(str, sorted(rows_with_warnings)))
+            print(f"  {Colors.BOLD}Warnings:{Colors.RESET}   Rows: {Colors.YELLOW}{warning_rows_str}{Colors.RESET}")
+        else:
+            print(f"  {Colors.BOLD}Warnings:{Colors.RESET}   None")
+        
+        print()
+        
+        # Print final pass/fail with clear visual indicator
+        if passed:
+            print(f"{Colors.GREEN}{Colors.BOLD}✓ PASS{Colors.RESET}\n")
+        else:
+            print(f"{Colors.RED}{Colors.BOLD}✗ FAIL{Colors.RESET} - {mismatched_rows} row(s) with mismatches, {total_mismatched_fields} field(s)\n")
+        
+        return passed, len(actual_rows), total_mismatched
+        
+    except Exception as e:
+        print(f"{Colors.RED}✗ ERROR: {e}{Colors.RESET}\n")
+        traceback.print_exc()
+        return False, 0, 0
+
+
+def test_handwritten_image() -> Tuple[bool, int, int]:
+    """Test handwritten image vehicle data."""
+    # Initialize passed at the top
+    passed = True
+    
+    print(f"{Colors.BOLD}{Colors.CYAN}{'='*80}{Colors.RESET}")
+    print(f"{Colors.BOLD}{Colors.CYAN}=== Testing Handwritten Image Vehicle Data ==={Colors.RESET}")
+    print(f"{Colors.BOLD}{Colors.CYAN}{'='*80}{Colors.RESET}\n")
+    
+    img_path = ROOT / "tests" / "vehicles" / "unstructured" / "handwritten_image_vehicles.jpg"
+    truth_file = ROOT / "tests" / "truth" / "vehicles" / "handwritten_vehicles.json"
+    mapping_id = "source_image_vehicles"
+    
+    try:
+        # Load truth file
+        print(f"{Colors.BLUE}DEBUG: Loading truth file from: {truth_file.resolve()}{Colors.RESET}")
+        print(f"{Colors.BLUE}DEBUG: Truth file exists: {truth_file.exists()}{Colors.RESET}")
+        expected_rows = load_truth_file(truth_file)
+        print(f"{Colors.BLUE}DEBUG: Loaded {len(expected_rows)} expected rows from truth file{Colors.RESET}")
+        
+        # Get mapping
+        mapping_config = get_mapping_by_id(mapping_id)
+        if not mapping_config:
+            print(f"{Colors.RED}✗ Mapping not found: {mapping_id}{Colors.RESET}\n")
+            return False, 0, 0
+        
+        # Run normalize_v2
+        try:
+            result = normalize_v2(
+                source=str(img_path),
+                mapping_config=mapping_config,
+                header_row_index=0,
+                validate=False
+            )
+            actual_rows = result.get("data", [])
+        except Exception as e:
+            print(f"{Colors.RED}ERROR during normalize_v2: {e}{Colors.RESET}")
+            traceback.print_exc()
+            return False, 0, 0
+        
+        print(f"{Colors.GREEN}✓{Colors.RESET} Rows extracted: {len(actual_rows)}")
+        
+        # Compare
+        print(f"Comparing expected vs actual...")
+        comparison = compare_expected_vs_actual(expected_rows, actual_rows)
+        total_mismatched = comparison.get("total_mismatched_fields", 0)
+        passed = len(comparison["matched_rows"]) == len(expected_rows) and total_mismatched == 0
+        
+        # Normalize rows for display
+        expected_norm = [normalize_row_for_comparison(row) for row in expected_rows]
+        actual_norm = [normalize_row_for_comparison(row) for row in actual_rows]
+        
+        # Print results with clean header
+        print()
+        print(f"{Colors.BOLD}{'─' * 80}{Colors.RESET}")
+        print(f"{Colors.BOLD}COMPARISON RESULTS{Colors.RESET}")
+        print(f"{Colors.BOLD}{'─' * 80}{Colors.RESET}")
+        print()
+        
+        # Group mismatches by row
+        mismatches_by_row = {}
+        extra_rows = []
+        missing_rows = []
+        
+        for mismatch in comparison["mismatches"]:
+            row_num = mismatch["row"]
+            mismatch_type = mismatch.get("type")
+            
+            if mismatch_type == "extra_row":
+                extra_rows.append(row_num)
+            elif mismatch_type == "missing_row":
+                missing_rows.append(row_num)
+            else:
+                if row_num not in mismatches_by_row:
+                    mismatches_by_row[row_num] = []
+                mismatches_by_row[row_num].append(mismatch)
+        
+        # Print row diffs and track rows with warnings
+        total_rows = max(len(expected_norm), len(actual_norm))
+        rows_with_warnings = []
+        for row_idx in range(total_rows):
+            row_num = row_idx + 1
+            
+            # Handle extra/missing rows
+            if row_num in extra_rows:
+                print(f"*** Expected row {row_num} has no actual row ***")
+                print()
+                continue
+            
+            if row_num in missing_rows:
+                print(f"*** Actual row {row_num} has no expected row ***")
+                print()
+                continue
+            
+            # Skip if row doesn't exist in either
+            if row_idx >= len(expected_norm) or row_idx >= len(actual_norm):
+                continue
+            
+            expected_row = expected_norm[row_idx]
+            actual_row = actual_norm[row_idx]
+            
+            # Track rows with warnings
+            actual_warnings = actual_row.get("_warnings", [])
+            if actual_warnings and len(actual_warnings) > 0:
+                rows_with_warnings.append(row_num)
+            
+            # Print diff for this row
+            num_mismatches = print_row_diff(row_num, expected_row, actual_row)
+            
+            # If perfect match, already printed by print_row_diff
+            if num_mismatches == 0:
+                continue
+        
+        # Print professional summary
+        print()
+        print(f"{Colors.BOLD}{'=' * 80}{Colors.RESET}")
+        print(f"{Colors.BOLD}SUMMARY{Colors.RESET}")
+        print(f"{Colors.BOLD}{'=' * 80}{Colors.RESET}")
+        
+        # Use a clean table format for summary
+        total_expected = len(expected_rows)
+        total_actual = len(actual_rows)
+        perfect_matches = len(comparison['matched_rows'])
+        mismatched_rows = len(comparison['mismatched_rows'])
+        total_mismatched_fields = comparison.get('total_mismatched_fields', 0)
+        
+        print(f"  {Colors.BOLD}Rows:{Colors.RESET}        Expected: {total_expected:<4} | Actual: {total_actual:<4}")
+        print(f"  {Colors.BOLD}Matches:{Colors.RESET}     Perfect: {Colors.GREEN}{perfect_matches:<4}{Colors.RESET} | Mismatched: {Colors.RED}{mismatched_rows:<4}{Colors.RESET}")
+        print(f"  {Colors.BOLD}Fields:{Colors.RESET}      Total mismatches: {Colors.RED}{total_mismatched_fields}{Colors.RESET}")
+        
+        if rows_with_warnings:
+            warning_rows_str = ", ".join(map(str, sorted(rows_with_warnings)))
+            print(f"  {Colors.BOLD}Warnings:{Colors.RESET}   Rows: {Colors.YELLOW}{warning_rows_str}{Colors.RESET}")
+        else:
+            print(f"  {Colors.BOLD}Warnings:{Colors.RESET}   None")
+        
+        print()
+        
+        # Print final pass/fail with clear visual indicator
+        if passed:
+            print(f"{Colors.GREEN}{Colors.BOLD}✓ PASS{Colors.RESET}\n")
+        else:
+            print(f"{Colors.RED}{Colors.BOLD}✗ FAIL{Colors.RESET} - {mismatched_rows} row(s) with mismatches, {total_mismatched_fields} field(s)\n")
+        
+        return passed, len(actual_rows), total_mismatched
+        
+    except Exception as e:
+        print(f"{Colors.RED}✗ ERROR: {e}{Colors.RESET}\n")
+        traceback.print_exc()
+        return False, 0, 0
+
+
 def test_image() -> Tuple[bool, int, int]:
     """Test image metadata vehicle data."""
     # Initialize passed at the top
@@ -1624,8 +1928,10 @@ def main():
     # Unstructured inputs
     results.append(("PDF", test_pdf()))
     results.append(("PDF2", test_pdf2()))
+    results.append(("Handwritten PDF", test_handwritten_pdf()))
     results.append(("Raw Text", test_raw_text()))
     results.append(("PNG Image", test_png()))
+    results.append(("Handwritten Image", test_handwritten_image()))
     results.append(("Image Metadata", test_image()))
     
     # Calculate summary
