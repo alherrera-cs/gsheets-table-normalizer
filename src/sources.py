@@ -583,18 +583,18 @@ def cleanup_vision_value(value: Optional[str]) -> Optional[str]:
 
 def _normalize_vision_value(field_name: str, value: Any, preserve_raw: bool = True) -> Any:
     """
-    Normalize values from Vision API output according to vehicle schema rules.
+    Clean and preserve raw values from Vision API output.
     
-    For PDF sources, we preserve raw values (no normalization) to match truth files.
-    For other sources, apply normalization.
+    ARCHITECTURAL DECISION: All normalization (canonical forms, transforms) happens in normalize_v2().
+    This function only does minimal cleaning (remove filler words, basic type conversion for numerics).
     
     Args:
         field_name: Field name from schema
         value: Raw value from Vision API
-        preserve_raw: If True, preserve raw values (for PDF sources). If False, normalize.
+        preserve_raw: If True, preserve raw values (all sources should use True now)
     
     Returns:
-        Normalized value (proper type: int for year/mileage, str for others, None for missing)
+        Cleaned raw value (preserves original format, minimal type conversion for numerics)
     """
     if value is None or value == "" or (isinstance(value, str) and value.strip().lower() in ['none', 'null', '']):
         return None
@@ -653,8 +653,12 @@ def _normalize_vision_value(field_name: str, value: Any, preserve_raw: bool = Tr
         # Return as string for other fields
         return value_str if value_str else None
     
-    # For non-PDF sources, apply normalization but PRESERVE invalid values
-    # Type conversions for numeric fields - preserve invalid values, warnings will be generated later
+    # ARCHITECTURAL DECISION: All normalization removed from this function.
+    # All canonical transformations (fuel_type, transmission, body_style, casing) happen in normalize_v2() via transforms.
+    # This function only does minimal cleaning and type conversion for numerics.
+    
+    # For non-PDF sources, apply same minimal cleaning as PDF sources (preserve raw values)
+    # Type conversions for numeric fields only - preserve invalid values, warnings will be generated later
     # CRITICAL: Preserve raw string values when type conversion fails (instead of returning None)
     # This allows normalize_v2 to generate warnings for invalid values
     if field_name == "year":
@@ -687,39 +691,15 @@ def _normalize_vision_value(field_name: str, value: Any, preserve_raw: bool = Tr
             # Preserve raw string value if conversion fails - let normalize_v2 generate warnings
             return value_str
     
-    # Normalize transmission
-    if field_name == "transmission":
-        value_lower = value_str.lower()
-        if "automatic" in value_lower or "auto" in value_lower:
-            return "automatic"
-        elif "manual" in value_lower:
-            return "manual"
-        elif "cvt" in value_lower:
-            return "cvt"
-        return value_str.lower()
+    # CRITICAL: Do NOT normalize transmission, fuel_type, body_style, casing here.
+    # All normalization happens in normalize_v2() via transforms.
+    # Return raw values as-is (only VIN gets uppercase for consistency)
     
-    # Normalize fuel_type
-    if field_name == "fuel_type":
-        value_lower = value_str.lower()
-        if value_lower in ["gas", "gasoline"]:
-            return "gasoline"
-        elif value_lower in ["diesel", "electric", "hybrid", "plug-in hybrid"]:
-            return value_lower
-        return value_str.lower()
-    
-    # Normalize body_style (lowercase)
-    if field_name == "body_style":
-        return value_str.lower()
-    
-    # VIN: uppercase
+    # VIN: uppercase (for consistency, but no other normalization)
     if field_name == "vin":
         return value_str.upper()
     
-    # Email: lowercase
-    if field_name == "owner_email":
-        return value_str.lower()
-    
-    # Return as string for other fields
+    # Return as string for all other fields (preserve raw, no normalization)
     return value_str if value_str else None
 
 
@@ -3945,11 +3925,14 @@ def _extract_table_with_vision_api(
                 "- If no reasonable inference is possible, return null — NEVER omit the field.\n"
                 "\n"
                 "Inference examples (MANDATORY):\n"
-                "- If text contains \"sedan\", body_style = \"sedan\"\n"
-                "- If text contains \"truck\" or \"pickup\", body_style = \"truck\"\n"
-                "- If text contains \"gas\", \"gasoline\", fuel_type = \"gasoline\"\n"
-                "- If text contains \"automatic\", \"auto\", \"8-speed auto\", transmission = \"automatic\"\n"
-                "- If text contains an email-like string, extract it as owner_email\n"
+                "- If text contains \"sedan\", body_style = \"sedan\" (extract raw value, normalization happens later)\n"
+                "- If text contains \"truck\" or \"pickup\", body_style = \"truck\" (extract raw value)\n"
+                "- If text contains \"gas\" or \"gasoline\", fuel_type = \"gas\" or \"gasoline\" (extract raw value as written, normalization happens later)\n"
+                "- If text contains \"automatic\", \"auto\", \"8-speed auto\", transmission = \"automatic\" or \"auto\" (extract raw value as written, normalization happens later)\n"
+                "- If text contains an email-like string, extract it as owner_email (extract exactly as written)\n"
+                "\n"
+                "IMPORTANT: Extract raw values only. Do NOT normalize, convert, or transform values.\n"
+                "All normalization (canonical forms, lowercase, type conversion) will be handled by the normalization pipeline.\n"
                 "\n"
                 "This rule applies to:\n"
                 "- PDFs\n"
@@ -3973,6 +3956,9 @@ def _extract_table_with_vision_api(
                 '    ["VIN1", null, 2024, "Toyota", "Camry", null, "notes", "Blue", 12345, null, "sedan", "gas", "automatic", "email@example.com", null],\n'
                 '    ["VIN2", null, 2020, "Ford", "F-150", null, "notes", "Red", 45210, null, "truck", "gas", "automatic", "email@example.com", null]\n'
                 '  ]\n'
+                "\n"
+                "NOTE: Values in examples show raw extracted values (e.g., 'gas', 'automatic').\n"
+                "Normalization (e.g., 'gas' → 'gasoline', 'auto' → 'automatic') happens in the normalization pipeline, not in Vision extraction.\n"
                 "}\n"
                 "\n"
                 "CRITICAL OUTPUT REQUIREMENTS:\n"
@@ -4090,6 +4076,8 @@ def _extract_table_with_vision_api(
                     system_prompt += f"{field.upper()}:\nExtract the {field} value exactly as written in the document.\n\n"
         else:
             # Fallback to basic prompt if mapping not found
+            # ARCHITECTURAL DECISION: Vision API extracts raw values only.
+            # All normalization happens in normalize_v2().
             system_prompt = (
                 "CRITICAL EXTRACTION RULES (HIGHEST PRIORITY):\n"
                 "\n"
@@ -4102,20 +4090,14 @@ def _extract_table_with_vision_api(
                 "- If no reasonable inference is possible, return null — NEVER omit the field.\n"
                 "\n"
                 "Inference examples (MANDATORY):\n"
-                "- If text contains \"sedan\", body_style = \"sedan\"\n"
-                "- If text contains \"truck\" or \"pickup\", body_style = \"truck\"\n"
-                "- If text contains \"gas\", \"gasoline\", fuel_type = \"gasoline\"\n"
-                "- If text contains \"automatic\", \"auto\", \"8-speed auto\", transmission = \"automatic\"\n"
-                "- If text contains an email-like string, extract it as owner_email\n"
+                "- If text contains \"sedan\", body_style = \"sedan\" (extract raw value, normalization happens later)\n"
+                "- If text contains \"truck\" or \"pickup\", body_style = \"truck\" (extract raw value)\n"
+                "- If text contains \"gas\" or \"gasoline\", fuel_type = \"gas\" or \"gasoline\" (extract raw value as written, normalization happens later)\n"
+                "- If text contains \"automatic\", \"auto\", \"8-speed auto\", transmission = \"automatic\" or \"auto\" (extract raw value as written, normalization happens later)\n"
+                "- If text contains an email-like string, extract it as owner_email (extract exactly as written)\n"
                 "\n"
-                "This rule applies to:\n"
-                "- PDFs\n"
-                "- Handwritten documents\n"
-                "- Images\n"
-                "- Tables\n"
-                "- Free-form notes\n"
-                "\n"
-                "Failure to infer a field when the information is visible is an error.\n"
+                "ARCHITECTURAL REQUIREMENT: Extract raw values only. Do NOT normalize, convert, or transform values.\n"
+                "All normalization (canonical forms, lowercase, type conversion) will be handled by the normalization pipeline.\n"
                 "\n"
                 "---\n"
                 "\n"
@@ -4129,6 +4111,9 @@ def _extract_table_with_vision_api(
                 '  "rows": [\n'
                 '    ["VIN1", null, 2024, "Toyota", "Camry", null, "notes", "Blue", 12345, null, "sedan", "gas", "automatic", "email@example.com", null]\n'
                 '  ]\n'
+                "\n"
+                "NOTE: Values in examples show raw extracted values (e.g., 'gas', 'automatic').\n"
+                "Normalization (e.g., 'gas' → 'gasoline', 'auto' → 'automatic') happens in the normalization pipeline, not in Vision extraction.\n"
                 "}\n"
                 "\n"
                 "CRITICAL OUTPUT REQUIREMENTS:\n"
@@ -4412,6 +4397,49 @@ def _extract_table_with_vision_api(
             is_scanned_pdf_routed_as_image = True
             logger.info(f"[Vision] Scanned PDF detected and routed as IMAGE: {file_path.name} - Using image-first Vision extraction (skipping OCR-first path)")
         
+        # CRITICAL FIX: Initialize ocr_vehicles_by_vin OUTSIDE the page loop
+        # This allows OCR vehicles from page 1 to be available for merging with Vision results on later pages
+        # Previously, this was reset every page (line 4463), causing OCR data from page 1 to be lost
+        ocr_vehicles_by_vin = {}
+        
+        # CRITICAL FIX: For IMAGE sources, extract OCR text from the image file as fallback
+        # This brings IMAGE extraction up to parity with PDF extraction (OCR + Vision merge)
+        if source_type == SourceType.IMAGE and not is_scanned_pdf_routed_as_image:
+            try:
+                from ocr.reader import extract_text_from_image
+                logger.info(f"[IMAGE] Extracting OCR text from image: {file_path.name}")
+                ocr_text_blocks, ocr_metadata = extract_text_from_image(file_path, enable_vision=False)
+                if ocr_text_blocks:
+                    from ocr.table_extract import _extract_raw_text
+                    full_ocr_text = _extract_raw_text(ocr_text_blocks)
+                    logger.info(f"[IMAGE] Extracted OCR text ({len(full_ocr_text)} chars) from image")
+                    
+                    # Parse vehicles from OCR text using the same logic as PDFs
+                    source_type_str = "image"
+                    document_defaults = _extract_document_level_defaults(full_ocr_text, source_type_str, file_path)
+                    blocks = split_by_vin(full_ocr_text)
+                    ocr_vehicles = [extract_fields_from_block(b, mapping=mapping_config, source_type=source_type_str) for b in blocks]
+                    
+                    # Apply document-level defaults
+                    for vehicle in ocr_vehicles:
+                        if vehicle:
+                            for field in ['body_style', 'fuel_type', 'transmission', 'mileage']:
+                                if vehicle.get(field) is None and document_defaults.get(field) is not None:
+                                    vehicle[field] = document_defaults[field]
+                            
+                            # Store OCR vehicles by VIN for merging with Vision results
+                            vin_value = vehicle.get('vin')
+                            if vin_value:
+                                ocr_vehicles_by_vin[vin_value] = vehicle
+                                logger.debug(f"[IMAGE] Extracted OCR vehicle: VIN={vin_value}")
+                    
+                    if ocr_vehicles_by_vin:
+                        logger.info(f"[IMAGE] Extracted {len(ocr_vehicles_by_vin)} vehicle(s) from OCR text")
+                else:
+                    logger.debug(f"[IMAGE] No OCR text blocks extracted from image")
+            except Exception as e:
+                logger.warning(f"[IMAGE] OCR extraction failed (will use Vision only): {e}")
+        
         for page_idx, img in enumerate(images):
             page_num = page_idx + 1
             
@@ -4459,6 +4487,8 @@ def _extract_table_with_vision_api(
             # For scanned PDFs routed as IMAGE: Skip OCR text path entirely, go straight to Vision API
             # For non-handwritten PDFs: PDF → text → block segmentation → extract_fields_from_block
             # For regular IMAGE sources: Use OCR text if available
+            # NOTE: ocr_vehicles_by_vin is now initialized BEFORE the page loop (line 4414)
+            # This ensures OCR vehicles from page 1 persist and can be merged with Vision results on later pages
             if (source_type == SourceType.PDF and not is_handwritten_pdf) or (source_type == SourceType.IMAGE and not is_scanned_pdf_routed_as_image):
                 # Only use OCR text path for:
                 # - Non-handwritten PDFs
@@ -4509,8 +4539,14 @@ def _extract_table_with_vision_api(
                         logger.info(f"[{source_type.name}] Extracted {len(extracted_vehicles)} vehicle(s) from page {page_num} segmented OCR text")
                         # #region agent log
                         with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
-                            f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H1","location":"sources.py:4290","message":"OCR text path: Using OCR extracted vehicles","data":{"extracted_vehicles_count":len(extracted_vehicles)},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
+                            vins_extracted = [v.get('vin') for v in extracted_vehicles if v and v.get('vin')]
+                            f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H1","location":"sources.py:4290","message":"OCR text path: Using OCR extracted vehicles","data":{"extracted_vehicles_count":len(extracted_vehicles),"vins":vins_extracted,"page_num":page_num},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
                         # #endregion
+                        # Store OCR-extracted vehicles by VIN for potential merging with Vision results
+                        ocr_vehicles_by_vin.update({v.get('vin'): v for v in extracted_vehicles if v and v.get('vin')})
+                        # DEBUG: Check if Row 6 was extracted
+                        if 'ST420RJ98FDHKL4E' in ocr_vehicles_by_vin:
+                            logger.info(f"[PDF] Row 6 (ST420RJ98FDHKL4E) found in OCR extraction on page {page_num}")
                         # Convert to 2D array format and clean "None" strings
                         for vehicle in extracted_vehicles:
                             vin_value = vehicle.get('vin')
@@ -4538,6 +4574,7 @@ def _extract_table_with_vision_api(
                                 with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
                                     f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H2","location":"sources.py:4006","message":"OCR text path: Adding vehicle to collector","data":{"vin_value":vin_value,"source_type":source_type.name},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
                             # #endregion
+                            # CRITICAL FIX: Initialize row INSIDE the loop for each vehicle
                             row = []
                             for field in canonical_schema:
                                 value = vehicle.get(field)
@@ -4710,24 +4747,20 @@ def _extract_table_with_vision_api(
                 "NATURAL LANGUAGE INFERENCE (REQUIRED):\n"
                 "Infer the following fields from natural language anywhere in the document section, even if unlabeled:\n"
                 "- body_style: Search for keywords like 'sedan', 'truck', 'SUV', 'van', 'coupe', 'hatchback', 'convertible', 'wagon', 'crossover'\n"
-                "  * Normalize to canonical forms: 'sedan', 'truck', 'suv', 'van', 'coupe', 'hatchback', 'convertible', 'wagon', 'crossover'\n"
+                "  * Extract the raw value as written (e.g., 'sedan', 'truck', 'SUV', 'Truck') - normalization will be applied later\n"
                 "  * Examples: '2024 Toyota Camry sedan' → body_style: 'sedan', 'Ford F-150 truck' → body_style: 'truck'\n"
                 "- fuel_type: Search for keywords like 'gas', 'gasoline', 'diesel', 'electric', 'hybrid'\n"
-                "  * Normalize to canonical forms: 'gasoline' (for 'gas' or 'gasoline'), 'diesel', 'electric', 'hybrid'\n"
-                "  * Examples: 'runs on gas' → fuel_type: 'gasoline', 'diesel engine' → fuel_type: 'diesel'\n"
+                "  * Extract the raw value as written (e.g., 'gas', 'gasoline', 'Gas') - normalization will be applied later\n"
+                "  * Examples: 'runs on gas' → fuel_type: 'gas', 'diesel engine' → fuel_type: 'diesel'\n"
                 "- transmission: Search for keywords like 'automatic', 'manual', 'CVT', 'auto'\n"
-                "  * Normalize to canonical forms: 'automatic' (for 'auto' or 'automatic'), 'manual', 'cvt'\n"
-                "  * Examples: 'automatic transmission' → transmission: 'automatic', '8-speed auto' → transmission: 'automatic'\n"
+                "  * Extract the raw value as written (e.g., 'automatic', 'auto', 'Auto') - normalization will be applied later\n"
+                "  * Examples: 'automatic transmission' → transmission: 'automatic', '8-speed auto' → transmission: 'auto'\n"
                 "- mileage: Search for numbers followed by 'miles', 'mi', 'mileage', or 'odometer'\n"
-                "  * Extract numeric value only (remove commas, 'miles', etc.)\n"
-                "  * Examples: '100,245 miles' → mileage: 100245, 'odometer: 89,000' → mileage: 89000\n"
+                "  * Extract the raw numeric value (may include commas, text, units) - normalization will clean it later\n"
+                "  * Examples: '100,245 miles' → mileage: '100,245 miles', 'odometer: 89,000' → mileage: '89,000'\n"
                 "\n"
-                "NORMALIZATION REQUIREMENTS:\n"
-                "- Normalize inferred values to canonical forms used by normalize_v2:\n"
-                "  * body_style: lowercase (e.g., 'SUV' → 'suv', 'Truck' → 'truck')\n"
-                "  * fuel_type: 'gas' or 'gasoline' → 'gasoline', 'auto' → 'automatic'\n"
-                "  * transmission: 'auto' → 'automatic', 'CVT' → 'cvt'\n"
-                "  * mileage: numeric integer only (remove commas, text, units)\n"
+                "IMPORTANT: Extract raw values only. Do NOT normalize, convert, or transform values.\n"
+                "All normalization (lowercase, canonical forms, type conversion) will be handled by the normalization pipeline.\n"
                 "\n"
                 "FIELD COMPLETENESS:\n"
                 "- Every row MUST include all schema fields in the exact order specified\n"
@@ -4848,8 +4881,21 @@ def _extract_table_with_vision_api(
                                             if vin_value and isinstance(vin_value, str):
                                                 # Strip punctuation and whitespace before checking
                                                 vin_upper_clean = vin_value.strip().upper().rstrip('.,;:!?')
-                                                # Check if VIN is a header token
-                                                if vin_upper_clean in invalid_vin_tokens:
+                                                # Check if VIN is a header token (exact match)
+                                                is_header_token = vin_upper_clean in invalid_vin_tokens
+                                                
+                                                # CRITICAL FIX: For IMAGE sources, use conservative fuzzy matching for header detection
+                                                # This prevents valid rows from being filtered due to OCR noise (e.g., "gasoline." -> "GASOLINE")
+                                                if not is_header_token and source_type == SourceType.IMAGE:
+                                                    from inference import fuzzy_match_header
+                                                    # Use conservative threshold (0.85) to catch OCR variations but not false positives
+                                                    for header_token in invalid_vin_tokens:
+                                                        if fuzzy_match_header(vin_upper_clean, header_token, threshold=0.85):
+                                                            is_header_token = True
+                                                            logger.debug(f"[Vision] Fuzzy matched header token: {vin_value} -> {header_token} (similarity >= 0.85)")
+                                                            break
+                                                
+                                                if is_header_token:
                                                     logger.warning(f"[Vision] Filtering row with invalid VIN (header token): {vin_value} -> {vin_upper_clean}")
                                                     # #region agent log
                                                     if source_type == SourceType.IMAGE:
@@ -5003,12 +5049,167 @@ def _extract_table_with_vision_api(
             
             # If Vision extracted rows, use them (but only if text extraction didn't work)
             if page_rows:
-                # For PDF, only use Vision if text extraction failed
+                # DEBUG: Log which page and how many rows
+                vin_index = canonical_schema.index('vin') if 'vin' in canonical_schema else 0
+                vins_in_page = [row[vin_index] if len(row) > vin_index else None for row in page_rows]
+                logger.info(f"[PDF] Vision extracted {len(page_rows)} row(s) from page {page_num}: VINs={vins_in_page}")
+                
+                # For PDF, merge Vision results with OCR results if OCR extracted the same VINs
                 if source_type == SourceType.PDF:
-                    # Check if we already have rows from text extraction
-                    if not all_rows or page_num not in vision_extracted_pages:
-                        all_rows.extend(page_rows)
+                    # Check if we have OCR-extracted vehicles stored earlier
+                    if ocr_vehicles_by_vin:
+                        # Merge Vision rows with OCR-extracted vehicles by VIN
+                        # If Vision has null critical fields but OCR has non-null values, prefer OCR
+                        critical_fields = ['year', 'make', 'model']
+                        critical_field_indices = [canonical_schema.index(f) for f in critical_fields if f in canonical_schema]
+                        
+                        for row_idx, vision_row in enumerate(page_rows):
+                            if len(vision_row) > vin_index:
+                                vision_vin = vision_row[vin_index]
+                                if vision_vin and vision_vin in ocr_vehicles_by_vin:
+                                    ocr_vehicle = ocr_vehicles_by_vin[vision_vin]
+                                    # Check if Vision has null critical fields but OCR has non-null values
+                                    vision_has_null_critical = all(
+                                        idx < len(vision_row) and (vision_row[idx] is None or vision_row[idx] == "")
+                                        for idx in critical_field_indices
+                                    )
+                                    ocr_has_non_null_critical = any(
+                                        ocr_vehicle.get(field) is not None and ocr_vehicle.get(field) != ""
+                                        for field in critical_fields
+                                    )
+                                    
+                                    if vision_has_null_critical and ocr_has_non_null_critical:
+                                        # Merge: prefer OCR values for critical fields when Vision has nulls
+                                        logger.info(f"[PDF] Merging OCR and Vision results for VIN {vision_vin} (Vision had null critical fields)")
+                                        for field_idx, field_name in enumerate(critical_fields):
+                                            if field_name in canonical_schema:
+                                                field_schema_idx = canonical_schema.index(field_name)
+                                                if field_schema_idx < len(vision_row):
+                                                    ocr_value = ocr_vehicle.get(field_name)
+                                                    if (vision_row[field_schema_idx] is None or vision_row[field_schema_idx] == "") and ocr_value is not None:
+                                                        vision_row[field_schema_idx] = ocr_value
+                                        # Also merge other fields that Vision might have missed
+                                        for field_name in canonical_schema:
+                                            if field_name not in critical_fields:
+                                                field_schema_idx = canonical_schema.index(field_name)
+                                                if field_schema_idx < len(vision_row):
+                                                    ocr_value = ocr_vehicle.get(field_name)
+                                                    if (vision_row[field_schema_idx] is None or vision_row[field_schema_idx] == "") and ocr_value is not None:
+                                                        vision_row[field_schema_idx] = ocr_value
+                    
+                    # CRITICAL FIX: Merge Vision rows with existing rows by VIN
+                    # Later pages may contain better data for the same VIN, so merge field-by-field
+                    # instead of skipping duplicate VINs
+                    vin_index = canonical_schema.index('vin') if 'vin' in canonical_schema else 0
+                    
+                    new_rows = []
+                    merged_count = 0
+                    for vision_row in page_rows:
+                        if len(vision_row) <= vin_index:
+                            continue
+                            
+                        vision_vin = vision_row[vin_index]
+                        if not vision_vin:
+                            continue
+                        
+                        # Find existing row with same VIN
+                        existing_row_idx = None
+                        for idx, existing_row in enumerate(all_rows):
+                            if len(existing_row) > vin_index and existing_row[vin_index] == vision_vin:
+                                existing_row_idx = idx
+                                break
+                        
+                        if existing_row_idx is not None:
+                            # Merge field-by-field into existing row
+                            existing_row = all_rows[existing_row_idx]
+                            fields_merged = []
+                            
+                            # Merge all canonical schema fields
+                            for field_idx in range(len(canonical_schema)):
+                                if field_idx < len(existing_row) and field_idx < len(vision_row):
+                                    existing_value = existing_row[field_idx]
+                                    new_value = vision_row[field_idx]
+                                    
+                                    # If existing is None/empty and new is not None/empty, fill it
+                                    if (existing_value is None or existing_value == "") and (new_value is not None and new_value != ""):
+                                        existing_row[field_idx] = new_value
+                                        field_name = canonical_schema[field_idx] if field_idx < len(canonical_schema) else f"field_{field_idx}"
+                                        fields_merged.append(field_name)
+                            
+                            # Preserve extra fields (like _is_handwritten, _is_vision_extracted)
+                            # These are appended after canonical schema fields
+                            if len(vision_row) > len(canonical_schema):
+                                # Ensure existing_row has space for extra fields
+                                while len(existing_row) < len(vision_row):
+                                    existing_row.append(None)
+                                # Merge extra fields (preserve flags from both)
+                                for extra_idx in range(len(canonical_schema), len(vision_row)):
+                                    if extra_idx < len(existing_row):
+                                        # For boolean flags, use OR logic (if either is True, keep True)
+                                        if isinstance(vision_row[extra_idx], bool) and isinstance(existing_row[extra_idx], bool):
+                                            existing_row[extra_idx] = existing_row[extra_idx] or vision_row[extra_idx]
+                                        # For other extra fields, prefer non-None values
+                                        elif (existing_row[extra_idx] is None or existing_row[extra_idx] == "") and (vision_row[extra_idx] is not None and vision_row[extra_idx] != ""):
+                                            existing_row[extra_idx] = vision_row[extra_idx]
+                            
+                            if fields_merged:
+                                logger.info(f"[PDF] Merged {len(fields_merged)} field(s) into existing row for VIN {vision_vin} from page {page_num}: {fields_merged}")
+                                merged_count += 1
+                            else:
+                                logger.debug(f"[PDF] VIN {vision_vin} from page {page_num} already exists with all fields filled, no merge needed")
+                        else:
+                            # New VIN, add as new row
+                            new_rows.append(vision_row)
+                    
+                    if new_rows:
+                        logger.info(f"[PDF] Adding {len(new_rows)} new Vision row(s) from page {page_num} to all_rows (total before: {len(all_rows)}, after: {len(all_rows) + len(new_rows)})")
+                        all_rows.extend(new_rows)
+                    if merged_count > 0:
+                        logger.info(f"[PDF] Merged {merged_count} existing row(s) from page {page_num} with Vision data")
+                    if not new_rows and merged_count == 0:
+                        logger.debug(f"[PDF] No new or merged rows from Vision page {page_num}")
                 elif source_type == SourceType.IMAGE:
+                    # CRITICAL FIX: Merge Vision results with OCR results for IMAGE sources (same as PDF)
+                    # This brings IMAGE extraction up to parity with PDF extraction
+                    if ocr_vehicles_by_vin:
+                        vin_index = canonical_schema.index('vin') if 'vin' in canonical_schema else 0
+                        critical_fields = ['year', 'make', 'model']
+                        critical_field_indices = [canonical_schema.index(f) for f in critical_fields if f in canonical_schema]
+                        
+                        for row_idx, vision_row in enumerate(page_rows):
+                            if len(vision_row) > vin_index:
+                                vision_vin = vision_row[vin_index]
+                                if vision_vin and vision_vin in ocr_vehicles_by_vin:
+                                    ocr_vehicle = ocr_vehicles_by_vin[vision_vin]
+                                    # Check if Vision has null critical fields but OCR has non-null values
+                                    vision_has_null_critical = all(
+                                        idx < len(vision_row) and (vision_row[idx] is None or vision_row[idx] == "")
+                                        for idx in critical_field_indices
+                                    )
+                                    ocr_has_non_null_critical = any(
+                                        ocr_vehicle.get(field) is not None and ocr_vehicle.get(field) != ""
+                                        for field in critical_fields
+                                    )
+                                    
+                                    if vision_has_null_critical and ocr_has_non_null_critical:
+                                        # Merge: prefer OCR values for critical fields when Vision has nulls
+                                        logger.info(f"[IMAGE] Merging OCR and Vision results for VIN {vision_vin} (Vision had null critical fields)")
+                                        for field_idx, field_name in enumerate(critical_fields):
+                                            if field_name in canonical_schema:
+                                                field_schema_idx = canonical_schema.index(field_name)
+                                                if field_schema_idx < len(vision_row):
+                                                    ocr_value = ocr_vehicle.get(field_name)
+                                                    if (vision_row[field_schema_idx] is None or vision_row[field_schema_idx] == "") and ocr_value is not None:
+                                                        vision_row[field_schema_idx] = ocr_value
+                                        # Also merge other fields that Vision might have missed
+                                        for field_name in canonical_schema:
+                                            if field_name not in critical_fields:
+                                                field_schema_idx = canonical_schema.index(field_name)
+                                                if field_schema_idx < len(vision_row):
+                                                    ocr_value = ocr_vehicle.get(field_name)
+                                                    if (vision_row[field_schema_idx] is None or vision_row[field_schema_idx] == "") and ocr_value is not None:
+                                                        vision_row[field_schema_idx] = ocr_value
+                    
                     # For IMAGE sources, collect rows for aggregation AFTER all pages are processed
                     # #region agent log
                     with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
@@ -5092,7 +5293,7 @@ def _extract_table_with_vision_api(
                                         with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
                                             f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H2","location":"sources.py:4271","message":"OCR fallback path: Filtered invalid VIN","data":{"vin":vin_value,"vin_upper_clean":vin_upper_clean},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
                                         # #endregion
-                                        continue
+                                    continue
                                 # #region agent log
                                 with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
                                     f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H2","location":"sources.py:4275","message":"OCR fallback path: Adding vehicle to collector","data":{"vin_value":vin_value},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
@@ -5159,9 +5360,12 @@ def _extract_table_with_vision_api(
                 for row in rows_for_vin:
                     for i, field in enumerate(canonical_schema):
                         value = row[i] if i < len(row) else None
-                        # Merge: last non-null value wins
-                        if value is not None and value != "":
+                        # CRITICAL FIX: Prefer non-null values (only overwrite if existing is None/empty and new is not None/empty)
+                        # This prevents later pages with nulls from overwriting good values from earlier pages
+                        existing_value = aggregated_vehicle[field]
+                        if (existing_value is None or existing_value == "") and (value is not None and value != ""):
                             aggregated_vehicle[field] = value
+                        # If both are non-null, keep existing (first non-null value wins)
                     # Preserve _is_handwritten from any row (if any row is handwritten, aggregated is handwritten)
                     if len(row) > len(canonical_schema) and row[len(canonical_schema)]:
                         aggregated_is_handwritten = True
@@ -5459,10 +5663,10 @@ def _extract_from_ocr_source(
                         mapping_id=domain_mapping_id,
                         **kwargs
                     )
-                # #region agent log
-                with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
-                    f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H1","location":"sources.py:4120","message":"PDF: _extract_table_with_vision_api result","data":{"result_is_none":vision_result is None,"result_length":len(vision_result) if vision_result else 0,"result_headers":vision_result[0] if vision_result and len(vision_result) > 0 else None},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
-                # #endregion
+                    # #region agent log
+                    with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
+                        f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H1","location":"sources.py:4120","message":"PDF: _extract_table_with_vision_api result","data":{"result_is_none":vision_result is None,"result_length":len(vision_result) if vision_result else 0,"result_headers":vision_result[0] if vision_result and len(vision_result) > 0 else None},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
+                    # #endregion
                 if vision_result and len(vision_result) > 1:  # Has header + at least one data row
                     logger.info(f"[PDF] Extracted {len(vision_result)-1} vehicle(s) from Vision API (header row excluded)")
                     return vision_result
@@ -6129,12 +6333,24 @@ def _extract_from_ocr_source(
         # #endregion
         
         # SAFEGUARD: For IMAGE sources, filter out rows where VIN is a header token
+        # CRITICAL FIX: Use conservative fuzzy matching for IMAGE sources to handle OCR noise
         if source_type == SourceType.IMAGE:
             # Try multiple possible VIN key names (case variations)
             vin_value = row_dict.get('vin') or row_dict.get('VIN') or row_dict.get('VIN Number') or row_dict.get('vin_number')
             if vin_value:
                 vin_upper_clean = str(vin_value).upper().strip().rstrip('.,;:!?')
-                if vin_upper_clean in invalid_vin_tokens:
+                is_header_token = vin_upper_clean in invalid_vin_tokens
+                
+                # Conservative fuzzy matching for OCR variations (threshold 0.85)
+                if not is_header_token:
+                    from inference import fuzzy_match_header
+                    for header_token in invalid_vin_tokens:
+                        if fuzzy_match_header(vin_upper_clean, header_token, threshold=0.85):
+                            is_header_token = True
+                            logger.debug(f"[IMAGE Table Extraction] Fuzzy matched header token: {vin_value} -> {header_token}")
+                            break
+                
+                if is_header_token:
                     logger.warning(f"[IMAGE Table Extraction] Filtering row with invalid VIN (header token): {vin_value} -> {vin_upper_clean}")
                     # #region agent log
                     with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:

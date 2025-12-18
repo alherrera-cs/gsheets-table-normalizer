@@ -1002,14 +1002,14 @@ def normalize_v2(
                         # OCR-extracted: only preserve if currently None/empty (existing behavior)
                         row_result[matching_target] = val
                         preserved_fields.append(matching_target)
-                    
-                    # #region agent log
-                    if row.get('vin') == 'ST420RJ98FDHKL4E' and matching_target in ['year', 'make', 'model', 'color', 'owner_email', 'transmission']:
-                        import json
-                        from datetime import datetime
-                        with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
-                            f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H4","location":"normalizer.py:799","message":"PDF Row 6: Safeguard preserved value","data":{"target_field":matching_target,"value":val,"current_value":current_value,"is_vision_extracted":is_vision_extracted},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
-                    # #endregion
+                        
+                        # #region agent log
+                        if row.get('vin') == 'ST420RJ98FDHKL4E' and matching_target in ['year', 'make', 'model', 'color', 'owner_email', 'transmission']:
+                            import json
+                            from datetime import datetime
+                            with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
+                                f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H4","location":"normalizer.py:799","message":"PDF Row 6: Safeguard preserved value","data":{"target_field":matching_target,"value":val,"current_value":current_value,"is_vision_extracted":is_vision_extracted},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
+                        # #endregion
             
             # CRITICAL FIX: For Vision-extracted rows, directly preserve ALL fields from row dict
             # This ensures fields extracted by Vision API (even if None) are preserved for warning generation
@@ -1024,10 +1024,55 @@ def normalize_v2(
                     # Only set if not already set (mappings take priority)
                     if field_name not in row_result or row_result.get(field_name) is None:
                         row_value = row.get(field_name)
+                        
+                        # CRITICAL FIX: Apply transforms for Vision-extracted values
+                        # Check if there's a transform for this field in the mappings
+                        field_mapping = None
+                        for mapping in mappings:
+                            if mapping.get("target_field") == field_name:
+                                field_mapping = mapping
+                                break
+                        
+                        if field_mapping and field_mapping.get("transform") and row_value is not None and row_value != "":
+                            transform = field_mapping.get("transform")
+                            transform_lower = transform.lower().strip()
+                            # Apply simple transforms directly
+                            simple_transforms = ["uppercase", "lowercase", "capitalize", "standardize_fuel_type"]
+                            if transform_lower in simple_transforms and '(' not in transform:
+                                row_value = _apply_simple_transform(transform, row_value)
+                        
                         # Preserve even None values (for warning generation)
                         row_result[field_name] = row_value
                         if row_value is not None and row_value != "":
                             preserved_fields.append(field_name)
+            
+            # CRITICAL FIX: Apply transforms to ALL fields that have transforms, even if already set
+            # This ensures transforms are applied even if values were set by merge operations or safeguards
+            for mapping in mappings:
+                target_field = mapping.get("target_field")
+                transform = mapping.get("transform")
+                if target_field and transform and target_field in row_result:
+                    current_value = row_result.get(target_field)
+                    if current_value is not None and current_value != "":
+                        transform_lower = transform.lower().strip()
+                        simple_transforms = ["uppercase", "lowercase", "capitalize", "standardize_fuel_type"]
+                        if transform_lower in simple_transforms and '(' not in transform:
+                            # Apply simple transform to ensure normalization (e.g., "gas" -> "gasoline")
+                            transformed_value = _apply_simple_transform(transform, current_value)
+                            if transformed_value != current_value:
+                                row_result[target_field] = transformed_value
+            
+            # CRITICAL FIX: Apply _normalize_value to ALL fields (not just those with transforms)
+            # This ensures transmission ("auto" -> "automatic"), body_style (lowercase), etc. are normalized
+            # even if they bypassed the mapping loop (e.g., Vision-extracted rows)
+            for field_name in row_result:
+                if field_name.startswith("_"):  # Skip metadata fields
+                    continue
+                current_value = row_result.get(field_name)
+                if current_value is not None and current_value != "":
+                    normalized_value = _normalize_value(field_name, current_value)
+                    if normalized_value != current_value:
+                        row_result[field_name] = normalized_value
             
             # SAFEGUARD: Field preservation validation - log warning if critical fields are still missing
             if row.get('vin'):
