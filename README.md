@@ -406,15 +406,82 @@ Field mappings convert source field names to canonical schema names:
 - `src/mappings/relationships_mappings.py`
 - `src/mappings/locations_mappings.py`
 
-#### Stage 5: Normalization (`src/normalizer.py`)
+#### Stage 5: Field Transforms (`src/transforms.py`)
+
+Field transforms are applied after raw value extraction but before type conversion. Transforms allow complex field manipulations using a string-based syntax.
+
+**Transform Functions** (29 available):
+
+**String Operations**:
+- `capitalize(field)`: Capitalize first letter
+- `uppercase(field)`: Convert to uppercase
+- `lowercase(field)`: Convert to lowercase
+- `prepend(field, prefix)`: Add prefix to value
+- `append(field, suffix)`: Add suffix to value
+- `join([field1, field2], separator)`: Join multiple fields
+- `slice(field, start, end)`: Extract substring
+- `regex(field, pattern, group)`: Extract using regex
+
+**Type Conversions**:
+- `date(field, format)`: Parse date string
+- `number(field)`: Convert to number
+- `currency(field)`: Parse currency value
+- `phone(field)`: Format phone number
+- `boolean(field)`: Convert to boolean
+
+**Array Operations**:
+- `split(field, delimiter)`: Split string into array
+- `index(array, index)`: Get array element
+- `first(array)`: Get first element
+- `last(array)`: Get last element
+- `length(array)`: Get array length
+- `sum(array)`: Sum numeric array
+- `count(array)`: Count array elements
+- `filter(array, condition)`: Filter array elements
+- `flatten(array)`: Flatten nested arrays
+- `arrayfrom(field1, field2, ...)`: Create array from fields
+
+**Conditional Operations**:
+- `if(condition, true_value, false_value)`: Conditional value
+- `checkif(field, value)`: Check if field equals value
+
+**Domain-Specific**:
+- `standardize_fuel_type(field)`: Standardize fuel type values
+- `combine_image_metadata_notes(...)`: Combine image metadata into notes
+
+**Transform Application** (`src/normalizer.py`, lines 1351-1410):
+
+1. Transforms are applied AFTER raw value extraction
+2. Transforms run BEFORE type conversion
+3. Row-based transforms (like `combine_image_metadata_notes`) can access entire row context
+4. Transform errors are captured and reported in `row_errors`
+
+**Example Transform Usage**:
+
+```python
+{
+    "target_field": "full_name",
+    "source_field": ["First Name", "Last Name"],
+    "transform": "join([firstName, lastName], ' ')"
+}
+```
+
+**Key functions**:
+
+- `apply_transform()`: Main transform application (`src/transforms.py:15`)
+- `parse_and_apply_transform()`: Transform parsing and execution (`src/transforms.py:37`)
+- `apply_transforms()`: Batch transform application (`src/transforms.py:1097`)
+
+#### Stage 6: Normalization (`src/normalizer.py`)
 
 The `normalize_v2()` function performs:
 
 1. **Field Mapping**: Apply mappings from source fields to canonical fields
-2. **Type Conversion**: Convert strings to integers, dates, etc.
-3. **Confidence Calculation**: Calculate confidence scores for each field
-4. **Warning Generation**: Generate data quality warnings
-5. **Schema Reordering**: Reorder fields to match canonical schema order
+2. **Field Transforms**: Apply transforms to mapped values (if specified)
+3. **Type Conversion**: Convert strings to integers, dates, etc.
+4. **Confidence Calculation**: Calculate confidence scores for each field
+5. **Warning Generation**: Generate data quality warnings
+6. **Schema Reordering**: Reorder fields to match canonical schema order
 
 **Key functions**:
 
@@ -422,7 +489,7 @@ The `normalize_v2()` function performs:
 - `calculate_field_confidence()`: Confidence scoring (lines 839-903)
 - `_generate_warnings()`: Warning generation (lines 965-1063)
 
-#### Stage 6: Validation (`src/schema.py`)
+#### Stage 7: Validation (`src/schema.py`)
 
 Schema validation ensures:
 
@@ -1215,73 +1282,197 @@ The system supports human review through:
 
 ---
 
-## Appendix: File Structure
+## Appendix: File Structure and Code Locations
+
+### Directory Structure
 
 ```
 gsheets-table-normalizer/
-├── src/
-│   ├── normalizer.py          # Main normalization logic
-│   ├── schema.py               # Schema definitions and reordering
-│   ├── sources.py              # Extraction and parsing logic
-│   ├── mappings/               # Field mapping configurations
+├── src/                        # Source code
+│   ├── normalizer.py          # Main normalization entry point
+│   ├── schema.py              # Schema definitions and field reordering
+│   ├── sources.py             # Source extraction and domain parsers
+│   ├── transforms.py          # Field transformation functions
+│   ├── external_tables.py     # Structured file loaders (CSV, Excel, etc.)
+│   ├── mappings.py            # Mapping registry and lookup
+│   ├── mappings/              # Field mapping configurations
 │   │   ├── drivers_mappings.py
 │   │   ├── vehicles_mappings.py
 │   │   ├── policies_mappings.py
 │   │   ├── claims_mappings.py
 │   │   ├── relationships_mappings.py
 │   │   └── locations_mappings.py
-│   └── ocr/                    # OCR extraction module
-│       ├── reader.py           # OCR engines (EasyOCR, Tesseract, Vision API)
-│       ├── parser.py            # Text block parsing
-│       ├── table_extract.py     # Table extraction
-│       └── models.py            # Data models
-├── tests/
-│   ├── test_all_sources.py     # Unified test runner
+│   └── ocr/                   # OCR extraction module
+│       ├── __init__.py
+│       ├── reader.py          # OCR engines (EasyOCR, Tesseract, Vision API)
+│       ├── parser.py          # Text block parsing and filtering
+│       ├── table_extract.py   # Table extraction from text blocks
+│       └── models.py          # Data models (TextBlock, OCRMetadata)
+├── tests/                      # Test suite
+│   ├── test_all_sources.py    # Unified test runner
 │   ├── test_policies_all_sources.py
 │   ├── test_drivers_all_sources.py
 │   ├── test_vehicles_all_sources.py
 │   ├── test_claims_all_sources.py
 │   ├── test_locations_all_sources.py
 │   ├── test_policy_vehicle_driver_link_all_sources.py
-│   └── truth/                  # Expected truth files
+│   ├── policies/              # Policy test data
+│   │   ├── structured/        # CSV, Excel, Airtable, Google Sheets
+│   │   └── unstructured/     # PDF, Raw Text
+│   ├── drivers/               # Driver test data
+│   ├── vehicles/              # Vehicle test data
+│   ├── claims/                # Claim test data
+│   ├── relationships/         # Relationship test data
+│   ├── locations/             # Location test data
+│   └── truth/                 # Expected truth files
 │       ├── policies/
 │       ├── drivers/
 │       ├── vehicles/
 │       ├── claims/
 │       ├── relationships/
 │       └── locations/
-├── requirements.txt            # Python dependencies
-└── README.md                   # User-facing documentation
+├── requirements.txt           # Python dependencies
+└── README.md                  # This documentation
 ```
+
+### Key File Locations
+
+#### Core Normalization (`src/normalizer.py`)
+
+- **`normalize_v2()`** (line 1065): Main entry point for normalization
+- **`calculate_field_confidence()`** (line 839): Confidence score calculation
+- **`_generate_warnings()`** (line 965): Warning generation logic
+- **Transform application** (lines 1351-1410): Field transform execution
+
+#### Source Extraction (`src/sources.py`)
+
+- **`_extract_from_structured_source()`**: CSV, Excel, Sheets, Airtable extraction
+- **`_extract_from_ocr_source()`**: PDF, Image, Raw Text extraction
+- **`_extract_table_with_vision_api()`** (line 4307): Vision API table extraction
+- **Domain parsers**:
+  - `parse_driver_raw_text()` (line 2765)
+  - `parse_vehicle_raw_text()` (line 2103)
+  - `parse_policy_raw_text()` (line 2417)
+  - `parse_claim_raw_text()` (line 3700)
+  - `parse_relationship_raw_text()` (line 4033)
+  - `parse_locations_raw_text()` (line 2633)
+
+#### Field Transforms (`src/transforms.py`)
+
+- **`apply_transform()`** (line 15): Main transform application
+- **`parse_and_apply_transform()`** (line 37): Transform parsing and execution
+- **Transform functions** (lines 236-869): All 29 transform implementations
+- **`apply_transforms()`** (line 1097): Batch transform application
+
+#### Schema Management (`src/schema.py`)
+
+- **Schema definitions**: `POLICY_SCHEMA_ORDER`, `DRIVER_SCHEMA_ORDER`, etc.
+- **Reordering functions**:
+  - `reorder_vehicle_fields()` (line 73)
+  - `reorder_policy_fields()` (line 140)
+  - `reorder_driver_fields()` (line 248)
+  - Similar functions for other domains
+
+#### OCR Extraction (`src/ocr/reader.py`)
+
+- **`extract_text_from_image()`** (line 52): Image OCR extraction
+- **`extract_text_from_pdf()`** (line 210): PDF OCR extraction
+- **`_extract_with_easyocr()`** (line 120): EasyOCR wrapper
+- **`_extract_with_tesseract()`** (line 182): Tesseract wrapper
+
+#### OCR Processing (`src/ocr/parser.py`)
+
+- **`parse_text_blocks()`**: Text block parsing and filtering
+- Block filtering and validation logic
+
+#### Table Extraction (`src/ocr/table_extract.py`)
+
+- **`extract_tables_from_blocks()`**: Table extraction from text blocks
+- Table detection and row extraction
+
+#### Mapping Configurations (`src/mappings/`)
+
+- **`drivers_mappings.py`**: Driver field mappings
+- **`vehicles_mappings.py`**: Vehicle field mappings
+- **`policies_mappings.py`**: Policy field mappings
+- **`claims_mappings.py`**: Claim field mappings
+- **`relationships_mappings.py`**: Relationship field mappings
+- **`locations_mappings.py`**: Location field mappings
+
+#### Test Suites (`tests/`)
+
+- **`test_all_sources.py`**: Unified test runner
+- **`test_policies_all_sources.py`**: Policy tests (confidence-aware)
+- **`test_drivers_all_sources.py`**: Driver tests (confidence-aware)
+- **`test_vehicles_all_sources.py`**: Vehicle tests (confidence-aware)
+- **`test_claims_all_sources.py`**: Claim tests
+- **`test_locations_all_sources.py`**: Location tests
+- **`test_policy_vehicle_driver_link_all_sources.py`**: Relationship tests
+
+#### Test Data (`tests/{domain}/`)
+
+- **`structured/`**: CSV, Excel, Airtable JSON, Google Sheets test files
+- **`unstructured/`**: PDF, Raw Text, Image test files
+
+#### Truth Files (`tests/truth/{domain}/`)
+
+- **`{source}.expected.json`**: Expected normalized output for each source
+- Manually verified ground truth for test comparisons
 
 ---
 
 ## Appendix: Key Functions Reference
 
-### Normalization
+### Normalization (`src/normalizer.py`)
 
-- `normalize_v2()`: Main normalization function (`src/normalizer.py:1065`)
-- `calculate_field_confidence()`: Confidence scoring (`src/normalizer.py:839`)
-- `_generate_warnings()`: Warning generation (`src/normalizer.py:965`)
+- **`normalize_v2()`** (line 1065): Main normalization entry point
+- **`calculate_field_confidence()`** (line 839): Confidence score calculation
+- **`_generate_warnings()`** (line 965): Warning generation logic
 
-### Extraction
+### Source Extraction (`src/sources.py`)
 
-- `parse_driver_raw_text()`: Driver parsing (`src/sources.py:2765`)
-- `parse_vehicle_raw_text()`: Vehicle parsing (`src/sources.py:2103`)
-- `parse_policy_raw_text()`: Policy parsing (`src/sources.py:2202`)
-- `parse_claim_raw_text()`: Claim parsing (`src/sources.py:3700`)
-- `parse_relationship_raw_text()`: Relationship parsing (`src/sources.py:3952`)
-- `parse_locations_raw_text()`: Location parsing (`src/sources.py:2633`)
+- **`_extract_from_structured_source()`**: Structured file extraction (CSV, Excel, Sheets, Airtable)
+- **`_extract_from_ocr_source()`**: Unstructured file extraction (PDF, Image, Raw Text)
+- **`_extract_table_with_vision_api()`** (line 4307): Vision API table extraction
+- **Domain parsers**:
+  - **`parse_driver_raw_text()`** (line 2765): Driver parsing from unstructured text
+  - **`parse_vehicle_raw_text()`** (line 2103): Vehicle parsing from unstructured text
+  - **`parse_policy_raw_text()`** (line 2417): Policy parsing from unstructured text
+  - **`parse_claim_raw_text()`** (line 3700): Claim parsing from unstructured text
+  - **`parse_relationship_raw_text()`** (line 4033): Relationship parsing from unstructured text
+  - **`parse_locations_raw_text()`** (line 2633): Location parsing from unstructured text
 
-### OCR
+### Field Transforms (`src/transforms.py`)
 
-- `extract_text_from_image()`: Image OCR (`src/ocr/reader.py:52`)
-- `extract_text_from_pdf()`: PDF OCR (`src/ocr/reader.py:210`)
-- `_extract_with_easyocr()`: EasyOCR wrapper (`src/ocr/reader.py:120`)
-- `_extract_with_tesseract()`: Tesseract wrapper (`src/ocr/reader.py:182`)
+- **`apply_transform()`** (line 15): Main transform application function
+- **`parse_and_apply_transform()`** (line 37): Transform parsing and execution
+- **`apply_transforms()`** (line 1097): Batch transform application
+- **Transform implementations** (lines 236-869): All 29 transform functions
 
-### Schema
+### OCR Extraction (`src/ocr/reader.py`)
 
-- `reorder_driver_fields()`: Driver reordering (`src/schema.py:248`)
-- `reorder_vehicle_fields()`: Vehicle reordering (`src/schema.py:73`)
-- `reorder_policy_fields()`: Policy reordering (`src/schema.py:140`)
+- **`extract_text_from_image()`** (line 52): Image OCR extraction (PNG, JPG, JPEG)
+- **`extract_text_from_pdf()`** (line 210): PDF OCR extraction
+- **`_extract_with_easyocr()`** (line 120): EasyOCR wrapper
+- **`_extract_with_tesseract()`** (line 182): Tesseract wrapper with PSM fallbacks
+
+### OCR Processing (`src/ocr/parser.py`)
+
+- **`parse_text_blocks()`**: Text block parsing and filtering
+
+### Table Extraction (`src/ocr/table_extract.py`)
+
+- **`extract_tables_from_blocks()`**: Table extraction from text blocks
+
+### Schema Management (`src/schema.py`)
+
+- **`reorder_vehicle_fields()`** (line 73): Vehicle field reordering
+- **`reorder_policy_fields()`** (line 140): Policy field reordering
+- **`reorder_driver_fields()`** (line 248): Driver field reordering
+- Similar reordering functions for other domains
+
+### Test Utilities (`tests/test_*_all_sources.py`)
+
+- **`filter_acceptable_mismatches()`**: Confidence-aware mismatch classification
+- **`compare_expected_vs_actual()`**: Row-by-row comparison logic
+- **`determine_test_status()`**: PASS/FAIL determination (drivers/vehicles)
