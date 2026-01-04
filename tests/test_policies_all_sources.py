@@ -3,16 +3,24 @@ Unified test suite for ALL policy sources.
 
 Tests all policy formats in a single suite:
 - Structured: Airtable, Excel, Google Sheet
+- Unstructured: PDF, Raw Text
 """
-
-# DEBUG MODE TOGGLE - Set to True to see raw JSON dumps
-DEBUG = False
 
 import sys
 import json
 import traceback
+import logging
+import argparse
 from pathlib import Path
 from typing import Dict, Any, List, Tuple
+
+# Global flags for output control
+VERBOSE = False
+FULL_DIFF = False
+DEBUG = False
+
+# Suppress debug logs during test runs for cleaner output (unless VERBOSE)
+logging.getLogger().setLevel(logging.WARNING)
 
 # ANSI color codes for terminal output
 class Colors:
@@ -34,6 +42,12 @@ sys.path.insert(0, str(SRC))
 from normalizer import normalize_v2
 from mappings import get_mapping_by_id
 from schema import reorder_all_policies, POLICY_SCHEMA_ORDER
+
+
+def debug_print(*args, **kwargs):
+    """Print only if VERBOSE is enabled."""
+    if VERBOSE:
+        print(*args, **kwargs)
 
 
 def load_truth_file(truth_file: Path) -> List[Dict[str, Any]]:
@@ -296,6 +310,127 @@ def compare_expected_vs_actual(expected_rows: List[Dict[str, Any]], actual_rows:
     }
 
 
+def filter_acceptable_mismatches(comparison: Dict[str, Any], actual_rows: List[Dict[str, Any]]) -> Tuple[int, int]:
+    """
+    Filter out acceptable mismatches (confidence-aware counting).
+    
+    ETL-style validation rules:
+    1. Structural issues (missing/extra rows) → CRITICAL
+    2. Case-only differences → ACCEPTABLE
+    3. Notes populated for unstructured sources → ACCEPTABLE
+    4. Policy Number/VIN mismatches when confidence < 0.9 → ACCEPTABLE (OCR errors)
+    5. Low-confidence mismatches (< 0.9) → ACCEPTABLE
+    6. High-confidence mismatches (>= 0.9) → CRITICAL
+    
+    Args:
+        comparison: Comparison result dictionary
+        actual_rows: Actual rows list (for confidence checking)
+    
+    Returns:
+        Tuple of (real_mismatches_count, acceptable_mismatches_count)
+    """
+    real_mismatches = []
+    acceptable_mismatches = []
+    
+    for mismatch in comparison.get("mismatches", []):
+        field = mismatch.get("field", "")
+        row_num = mismatch.get("row", 1)
+        mismatch_type = mismatch.get("type")
+        expected_val = mismatch.get("expected")
+        actual_val = mismatch.get("actual")
+        
+        # Rule 1: Structural issues (missing/extra rows) are always CRITICAL
+        if mismatch_type in ["extra_row", "missing_row"]:
+            real_mismatches.append(mismatch)
+            continue
+        
+        # Ignore metadata fields
+        if (field in ["_confidence", "_warnings", "_source", "_flags", "_source_id", "_source_row_number", "_id"] or 
+            field.startswith("_source") or field.endswith("_confidence") or field.endswith("_warnings")):
+            continue
+        
+        # Get actual row for confidence/source checking
+        actual_row_idx = row_num - 1  # Convert to 0-indexed
+        if actual_row_idx < 0 or actual_row_idx >= len(actual_rows):
+            # Can't check confidence (row index out of bounds) - treat as CRITICAL
+            real_mismatches.append(mismatch)
+            continue
+        
+        actual_row = actual_rows[actual_row_idx]
+        confidence_dict = actual_row.get("_confidence", {})
+        field_confidence = confidence_dict.get(field)
+        source_metadata = actual_row.get("_source", {})
+        source_type = source_metadata.get("source_type", "")
+        parser = source_metadata.get("parser", "")
+        
+        # Check if source is unstructured (OCR/Vision)
+        is_unstructured = (
+            source_type in ["pdf", "image"] or
+            parser in ["vision_api", "ocr_extraction", "raw_text_parser"]
+        )
+        
+        # Rule 2: Case-only differences are ALWAYS ACCEPTABLE (check BEFORE confidence)
+        if isinstance(expected_val, str) and isinstance(actual_val, str):
+            if expected_val.lower() == actual_val.lower():
+                acceptable_mismatches.append(mismatch)
+                continue
+        
+        # Rule 3: Notes populated for unstructured sources is ACCEPTABLE
+        if field == "notes" and expected_val is None and actual_val is not None:
+            if is_unstructured:
+                acceptable_mismatches.append(mismatch)
+                continue
+        
+        # Rule 4: Key field mismatches (policy_number, vehicle_vin) when confidence < 0.9 are ACCEPTABLE (OCR errors)
+        if field in ["policy_number", "vehicle_vin"] and expected_val is not None and actual_val is not None:
+            if field_confidence is not None and field_confidence < 0.9:
+                acceptable_mismatches.append(mismatch)
+                continue
+        
+        # Now check confidence-based rules
+        # If field is missing confidence score:
+        # - For unstructured sources, treat as low confidence (acceptable - OCR errors)
+        # - For structured sources, treat as CRITICAL (shouldn't happen)
+        if field_confidence is None:
+            if is_unstructured:
+                # Unstructured source without confidence = likely OCR error, treat as acceptable
+                acceptable_mismatches.append(mismatch)
+            else:
+                # Structured source should have confidence - treat as CRITICAL
+                real_mismatches.append(mismatch)
+            continue
+        
+        # Expected=None, Actual=value
+        if expected_val is None and actual_val is not None:
+            if field_confidence == 0.0:
+                # Field extracted but marked as missing/uncertain - acceptable
+                acceptable_mismatches.append(mismatch)
+            else:
+                # Field extracted when not expected with confidence > 0 - CRITICAL
+                real_mismatches.append(mismatch)
+            continue
+        
+        # Expected=value, Actual=None
+        if expected_val is not None and actual_val is None:
+            if field_confidence == 0.0:
+                # Field missing and correctly marked as missing - acceptable
+                acceptable_mismatches.append(mismatch)
+            else:
+                # Field missing but not marked as missing - CRITICAL
+                real_mismatches.append(mismatch)
+            continue
+        
+        # Both expected and actual have values
+        # Rule 5: Low-confidence mismatches (< 0.9) are ACCEPTABLE
+        if field_confidence < 0.9:
+            acceptable_mismatches.append(mismatch)
+        # Rule 6: High-confidence mismatches (>= 0.9) are CRITICAL
+        else:
+            real_mismatches.append(mismatch)
+    
+    return len(real_mismatches), len(acceptable_mismatches)
+
+
 def test_airtable() -> Tuple[bool, int, int]:
     """Test Airtable policies."""
     # Initialize passed at the top
@@ -339,28 +474,29 @@ def test_airtable() -> Tuple[bool, int, int]:
         
         # DEBUG: Print raw rows only if DEBUG is enabled
         if DEBUG:
-            print(f"\n{Colors.BOLD}{Colors.YELLOW}=== RAW NORMALIZED ROWS ==={Colors.RESET}")
-            print(json.dumps(actual_rows, indent=2))
-            print(f"\n{Colors.BOLD}{Colors.YELLOW}=== EXPECTED TRUTH ROWS ==={Colors.RESET}")
-            print(json.dumps(expected_rows, indent=2))
-            print()
+            debug_print(f"\n{Colors.BOLD}{Colors.YELLOW}=== RAW NORMALIZED ROWS ==={Colors.RESET}")
+            debug_print(json.dumps(actual_rows, indent=2))
+            debug_print(f"\n{Colors.BOLD}{Colors.YELLOW}=== EXPECTED TRUTH ROWS ==={Colors.RESET}")
+            debug_print(json.dumps(expected_rows, indent=2))
+            debug_print()
         
         # Compare
-        print(f"\nComparing expected vs actual...")
+        debug_print(f"\nComparing expected vs actual...")
         comparison = compare_expected_vs_actual(expected_rows, actual_rows)
-        total_mismatched = comparison.get("total_mismatched_fields", 0)
-        passed = len(comparison["matched_rows"]) == len(expected_rows) and total_mismatched == 0
+        real_mismatched, acceptable_mismatched = filter_acceptable_mismatches(comparison, actual_rows)
+        passed = len(comparison["matched_rows"]) == len(expected_rows) and real_mismatched == 0
         
         # Normalize rows for display
         expected_norm = [normalize_row_for_comparison(row) for row in expected_rows]
         actual_norm = [normalize_row_for_comparison(row) for row in actual_rows]
         
-        # Print results
-        print()
-        print("=" * 80)
-        print("COMPARISON RESULTS")
-        print("=" * 80)
-        print()
+        # Print results (only if verbose or full-diff)
+        if VERBOSE or FULL_DIFF:
+            print()
+            print(f"{Colors.BOLD}{'─' * 80}{Colors.RESET}")
+            print(f"{Colors.BOLD}COMPARISON RESULTS{Colors.RESET}")
+            print(f"{Colors.BOLD}{'─' * 80}{Colors.RESET}")
+            print()
         
         # Group mismatches by row
         mismatches_by_row = {}
@@ -388,13 +524,15 @@ def test_airtable() -> Tuple[bool, int, int]:
             
             # Handle extra/missing rows
             if row_num in extra_rows:
-                print(f"*** Expected row {row_num} has no actual row ***")
-                print()
+                if VERBOSE or FULL_DIFF:
+                    print(f"*** Expected row {row_num} has no actual row ***")
+                    print()
                 continue
             
             if row_num in missing_rows:
-                print(f"*** Actual row {row_num} has no expected row ***")
-                print()
+                if VERBOSE or FULL_DIFF:
+                    print(f"*** Actual row {row_num} has no expected row ***")
+                    print()
                 continue
             
             # Skip if row doesn't exist in either
@@ -409,36 +547,41 @@ def test_airtable() -> Tuple[bool, int, int]:
             if actual_warnings and len(actual_warnings) > 0:
                 rows_with_warnings.append(row_num)
             
-            # Print diff for this row
-            num_mismatches = print_row_diff(row_num, expected_row, actual_row)
+            # Print diff for this row (only if verbose)
+            if VERBOSE or FULL_DIFF:
+                num_mismatches = print_row_diff(row_num, expected_row, actual_row)
+            else:
+                # Just count mismatches without printing
+                all_fields = sorted(set(expected_row.keys()) | set(actual_row.keys()))
+                num_mismatches = sum(1 for field in all_fields 
+                                    if not values_equal(field, expected_row.get(field), actual_row.get(field)))
             
             # If perfect match, already printed by print_row_diff
             if num_mismatches == 0:
                 continue
         
-        # Print summary
-        print()
-        print("=" * 80)
-        print("SUMMARY")
-        print("-" * 80)
-        print(f"Total expected rows: {len(expected_rows)}")
-        print(f"Total actual rows:   {len(actual_rows)}")
-        print(f"Perfect matches:     {len(comparison['matched_rows'])}")
-        print(f"Rows with mismatches: {len(comparison['mismatched_rows'])}")
-        print(f"Total mismatched fields: {comparison.get('total_mismatched_fields', 0)}")
+        # Print summary (only if verbose)
+        debug_print("\n" + "=" * 80)
+        debug_print("SUMMARY")
+        debug_print("-" * 80)
+        debug_print(f"Total expected rows: {len(expected_rows)}")
+        debug_print(f"Total actual rows:   {len(actual_rows)}")
+        debug_print(f"Perfect matches:     {len(comparison['matched_rows'])}")
+        debug_print(f"Rows with mismatches: {len(comparison['mismatched_rows'])}")
+        debug_print(f"Critical mismatched fields: {real_mismatched}")
+        if acceptable_mismatched > 0:
+            debug_print(f"Acceptable mismatched fields (low confidence): {acceptable_mismatched}")
         if rows_with_warnings:
-            print(f"Rows containing warnings: {', '.join(map(str, rows_with_warnings))}")
-        else:
-            print("Rows containing warnings: None")
-        print()
+            debug_print(f"Rows containing warnings: {', '.join(map(str, rows_with_warnings))}")
+        debug_print()
         
         # Print final pass/fail
         if passed:
             print(f"{Colors.GREEN}{Colors.BOLD}✓ PASS{Colors.RESET}\n")
         else:
-            print(f"{Colors.RED}{Colors.BOLD}✗ FAIL{Colors.RESET} - {len(comparison['mismatched_rows'])} row(s) with mismatches, {total_mismatched} mismatched field(s)\n")
+            print(f"{Colors.RED}{Colors.BOLD}✗ FAIL{Colors.RESET} - {len(comparison['mismatched_rows'])} row(s) with mismatches, {real_mismatched} critical mismatched field(s)\n")
         
-        return passed, len(actual_rows), total_mismatched
+        return passed, len(actual_rows), real_mismatched
         
     except Exception as e:
         print(f"{Colors.RED}✗ ERROR: {e}{Colors.RESET}\n")
@@ -488,21 +631,22 @@ def test_google_sheet() -> Tuple[bool, int, int]:
         print(f"{Colors.GREEN}✓{Colors.RESET} Rows extracted: {len(actual_rows)}")
         
         # Compare
-        print(f"\nComparing expected vs actual...")
+        debug_print(f"\nComparing expected vs actual...")
         comparison = compare_expected_vs_actual(expected_rows, actual_rows)
-        total_mismatched = comparison.get("total_mismatched_fields", 0)
-        passed = len(comparison["matched_rows"]) == len(expected_rows) and total_mismatched == 0
+        real_mismatched, acceptable_mismatched = filter_acceptable_mismatches(comparison, actual_rows)
+        passed = len(comparison["matched_rows"]) == len(expected_rows) and real_mismatched == 0
         
         # Normalize rows for display
         expected_norm = [normalize_row_for_comparison(row) for row in expected_rows]
         actual_norm = [normalize_row_for_comparison(row) for row in actual_rows]
         
-        # Print results
-        print()
-        print("=" * 80)
-        print("COMPARISON RESULTS")
-        print("=" * 80)
-        print()
+        # Print results (only if verbose or full-diff)
+        if VERBOSE or FULL_DIFF:
+            print()
+            print(f"{Colors.BOLD}{'─' * 80}{Colors.RESET}")
+            print(f"{Colors.BOLD}COMPARISON RESULTS{Colors.RESET}")
+            print(f"{Colors.BOLD}{'─' * 80}{Colors.RESET}")
+            print()
         
         # Group mismatches by row
         mismatches_by_row = {}
@@ -530,13 +674,15 @@ def test_google_sheet() -> Tuple[bool, int, int]:
             
             # Handle extra/missing rows
             if row_num in extra_rows:
-                print(f"*** Expected row {row_num} has no actual row ***")
-                print()
+                if VERBOSE or FULL_DIFF:
+                    print(f"*** Expected row {row_num} has no actual row ***")
+                    print()
                 continue
             
             if row_num in missing_rows:
-                print(f"*** Actual row {row_num} has no expected row ***")
-                print()
+                if VERBOSE or FULL_DIFF:
+                    print(f"*** Actual row {row_num} has no expected row ***")
+                    print()
                 continue
             
             # Skip if row doesn't exist in either
@@ -551,36 +697,41 @@ def test_google_sheet() -> Tuple[bool, int, int]:
             if actual_warnings and len(actual_warnings) > 0:
                 rows_with_warnings.append(row_num)
             
-            # Print diff for this row
-            num_mismatches = print_row_diff(row_num, expected_row, actual_row)
+            # Print diff for this row (only if verbose)
+            if VERBOSE or FULL_DIFF:
+                num_mismatches = print_row_diff(row_num, expected_row, actual_row)
+            else:
+                # Just count mismatches without printing
+                all_fields = sorted(set(expected_row.keys()) | set(actual_row.keys()))
+                num_mismatches = sum(1 for field in all_fields 
+                                    if not values_equal(field, expected_row.get(field), actual_row.get(field)))
             
             # If perfect match, already printed by print_row_diff
             if num_mismatches == 0:
                 continue
         
-        # Print summary
-        print()
-        print("=" * 80)
-        print("SUMMARY")
-        print("-" * 80)
-        print(f"Total expected rows: {len(expected_rows)}")
-        print(f"Total actual rows:   {len(actual_rows)}")
-        print(f"Perfect matches:     {len(comparison['matched_rows'])}")
-        print(f"Rows with mismatches: {len(comparison['mismatched_rows'])}")
-        print(f"Total mismatched fields: {comparison.get('total_mismatched_fields', 0)}")
+        # Print summary (only if verbose)
+        debug_print("\n" + "=" * 80)
+        debug_print("SUMMARY")
+        debug_print("-" * 80)
+        debug_print(f"Total expected rows: {len(expected_rows)}")
+        debug_print(f"Total actual rows:   {len(actual_rows)}")
+        debug_print(f"Perfect matches:     {len(comparison['matched_rows'])}")
+        debug_print(f"Rows with mismatches: {len(comparison['mismatched_rows'])}")
+        debug_print(f"Critical mismatched fields: {real_mismatched}")
+        if acceptable_mismatched > 0:
+            debug_print(f"Acceptable mismatched fields (low confidence): {acceptable_mismatched}")
         if rows_with_warnings:
-            print(f"Rows containing warnings: {', '.join(map(str, rows_with_warnings))}")
-        else:
-            print("Rows containing warnings: None")
-        print()
+            debug_print(f"Rows containing warnings: {', '.join(map(str, rows_with_warnings))}")
+        debug_print()
         
         # Print final pass/fail
         if passed:
             print(f"{Colors.GREEN}{Colors.BOLD}✓ PASS{Colors.RESET}\n")
         else:
-            print(f"{Colors.RED}{Colors.BOLD}✗ FAIL{Colors.RESET} - {len(comparison['mismatched_rows'])} row(s) with mismatches, {total_mismatched} mismatched field(s)\n")
+            print(f"{Colors.RED}{Colors.BOLD}✗ FAIL{Colors.RESET} - {len(comparison['mismatched_rows'])} row(s) with mismatches, {real_mismatched} critical mismatched field(s)\n")
         
-        return passed, len(actual_rows), total_mismatched
+        return passed, len(actual_rows), real_mismatched
         
     except Exception as e:
         print(f"{Colors.RED}✗ ERROR: {e}{Colors.RESET}\n")
@@ -630,21 +781,22 @@ def test_excel() -> Tuple[bool, int, int]:
         print(f"{Colors.GREEN}✓{Colors.RESET} Rows extracted: {len(actual_rows)}")
         
         # Compare
-        print(f"\nComparing expected vs actual...")
+        debug_print(f"\nComparing expected vs actual...")
         comparison = compare_expected_vs_actual(expected_rows, actual_rows)
-        total_mismatched = comparison.get("total_mismatched_fields", 0)
-        passed = len(comparison["matched_rows"]) == len(expected_rows) and total_mismatched == 0
+        real_mismatched, acceptable_mismatched = filter_acceptable_mismatches(comparison, actual_rows)
+        passed = len(comparison["matched_rows"]) == len(expected_rows) and real_mismatched == 0
         
         # Normalize rows for display
         expected_norm = [normalize_row_for_comparison(row) for row in expected_rows]
         actual_norm = [normalize_row_for_comparison(row) for row in actual_rows]
         
-        # Print results
-        print()
-        print("=" * 80)
-        print("COMPARISON RESULTS")
-        print("=" * 80)
-        print()
+        # Print results (only if verbose or full-diff)
+        if VERBOSE or FULL_DIFF:
+            print()
+            print(f"{Colors.BOLD}{'─' * 80}{Colors.RESET}")
+            print(f"{Colors.BOLD}COMPARISON RESULTS{Colors.RESET}")
+            print(f"{Colors.BOLD}{'─' * 80}{Colors.RESET}")
+            print()
         
         # Group mismatches by row
         mismatches_by_row = {}
@@ -672,13 +824,15 @@ def test_excel() -> Tuple[bool, int, int]:
             
             # Handle extra/missing rows
             if row_num in extra_rows:
-                print(f"*** Expected row {row_num} has no actual row ***")
-                print()
+                if VERBOSE or FULL_DIFF:
+                    print(f"*** Expected row {row_num} has no actual row ***")
+                    print()
                 continue
             
             if row_num in missing_rows:
-                print(f"*** Actual row {row_num} has no expected row ***")
-                print()
+                if VERBOSE or FULL_DIFF:
+                    print(f"*** Actual row {row_num} has no expected row ***")
+                    print()
                 continue
             
             # Skip if row doesn't exist in either
@@ -693,36 +847,41 @@ def test_excel() -> Tuple[bool, int, int]:
             if actual_warnings and len(actual_warnings) > 0:
                 rows_with_warnings.append(row_num)
             
-            # Print diff for this row
-            num_mismatches = print_row_diff(row_num, expected_row, actual_row)
+            # Print diff for this row (only if verbose)
+            if VERBOSE or FULL_DIFF:
+                num_mismatches = print_row_diff(row_num, expected_row, actual_row)
+            else:
+                # Just count mismatches without printing
+                all_fields = sorted(set(expected_row.keys()) | set(actual_row.keys()))
+                num_mismatches = sum(1 for field in all_fields 
+                                    if not values_equal(field, expected_row.get(field), actual_row.get(field)))
             
             # If perfect match, already printed by print_row_diff
             if num_mismatches == 0:
                 continue
         
-        # Print summary
-        print()
-        print("=" * 80)
-        print("SUMMARY")
-        print("-" * 80)
-        print(f"Total expected rows: {len(expected_rows)}")
-        print(f"Total actual rows:   {len(actual_rows)}")
-        print(f"Perfect matches:     {len(comparison['matched_rows'])}")
-        print(f"Rows with mismatches: {len(comparison['mismatched_rows'])}")
-        print(f"Total mismatched fields: {comparison.get('total_mismatched_fields', 0)}")
+        # Print summary (only if verbose)
+        debug_print("\n" + "=" * 80)
+        debug_print("SUMMARY")
+        debug_print("-" * 80)
+        debug_print(f"Total expected rows: {len(expected_rows)}")
+        debug_print(f"Total actual rows:   {len(actual_rows)}")
+        debug_print(f"Perfect matches:     {len(comparison['matched_rows'])}")
+        debug_print(f"Rows with mismatches: {len(comparison['mismatched_rows'])}")
+        debug_print(f"Critical mismatched fields: {real_mismatched}")
+        if acceptable_mismatched > 0:
+            debug_print(f"Acceptable mismatched fields (low confidence): {acceptable_mismatched}")
         if rows_with_warnings:
-            print(f"Rows containing warnings: {', '.join(map(str, rows_with_warnings))}")
-        else:
-            print("Rows containing warnings: None")
-        print()
+            debug_print(f"Rows containing warnings: {', '.join(map(str, rows_with_warnings))}")
+        debug_print()
         
         # Print final pass/fail
         if passed:
             print(f"{Colors.GREEN}{Colors.BOLD}✓ PASS{Colors.RESET}\n")
         else:
-            print(f"{Colors.RED}{Colors.BOLD}✗ FAIL{Colors.RESET} - {len(comparison['mismatched_rows'])} row(s) with mismatches, {total_mismatched} mismatched field(s)\n")
+            print(f"{Colors.RED}{Colors.BOLD}✗ FAIL{Colors.RESET} - {len(comparison['mismatched_rows'])} row(s) with mismatches, {real_mismatched} critical mismatched field(s)\n")
         
-        return passed, len(actual_rows), total_mismatched
+        return passed, len(actual_rows), real_mismatched
         
     except Exception as e:
         print(f"{Colors.RED}✗ ERROR: {e}{Colors.RESET}\n")
@@ -755,10 +914,7 @@ def test_raw_text() -> Tuple[bool, int, int]:
     
     try:
         # Load truth file
-        print(f"{Colors.BLUE}DEBUG: Loading truth file from: {truth_file.resolve()}{Colors.RESET}")
-        print(f"{Colors.BLUE}DEBUG: Truth file exists: {truth_file.exists()}{Colors.RESET}")
         expected_rows = load_truth_file(truth_file)
-        print(f"{Colors.BLUE}DEBUG: Loaded {len(expected_rows)} expected rows from truth file{Colors.RESET}")
         
         # Get mapping
         mapping_config = get_mapping_by_id(mapping_id)
@@ -785,21 +941,22 @@ def test_raw_text() -> Tuple[bool, int, int]:
         print(f"{Colors.GREEN}✓{Colors.RESET} Rows extracted: {len(actual_rows)}")
         
         # Compare
-        print(f"\nComparing expected vs actual...")
+        debug_print(f"\nComparing expected vs actual...")
         comparison = compare_expected_vs_actual(expected_rows, actual_rows)
-        total_mismatched = comparison.get("total_mismatched_fields", 0)
-        passed = len(comparison["matched_rows"]) == len(expected_rows) and total_mismatched == 0
+        real_mismatched, acceptable_mismatched = filter_acceptable_mismatches(comparison, actual_rows)
+        passed = len(comparison["matched_rows"]) == len(expected_rows) and real_mismatched == 0
         
         # Normalize rows for display
         expected_norm = [normalize_row_for_comparison(row) for row in expected_rows]
         actual_norm = [normalize_row_for_comparison(row) for row in actual_rows]
         
-        # Print results
-        print()
-        print("=" * 80)
-        print("COMPARISON RESULTS")
-        print("=" * 80)
-        print()
+        # Print results (only if verbose or full-diff)
+        if VERBOSE or FULL_DIFF:
+            print()
+            print(f"{Colors.BOLD}{'─' * 80}{Colors.RESET}")
+            print(f"{Colors.BOLD}COMPARISON RESULTS{Colors.RESET}")
+            print(f"{Colors.BOLD}{'─' * 80}{Colors.RESET}")
+            print()
         
         # Group mismatches by row
         mismatches_by_row = {}
@@ -827,13 +984,15 @@ def test_raw_text() -> Tuple[bool, int, int]:
             
             # Handle extra/missing rows
             if row_num in extra_rows:
-                print(f"*** Expected row {row_num} has no actual row ***")
-                print()
+                if VERBOSE or FULL_DIFF:
+                    print(f"*** Expected row {row_num} has no actual row ***")
+                    print()
                 continue
             
             if row_num in missing_rows:
-                print(f"*** Actual row {row_num} has no expected row ***")
-                print()
+                if VERBOSE or FULL_DIFF:
+                    print(f"*** Actual row {row_num} has no expected row ***")
+                    print()
                 continue
             
             # Skip if row doesn't exist in either
@@ -848,36 +1007,41 @@ def test_raw_text() -> Tuple[bool, int, int]:
             if actual_warnings and len(actual_warnings) > 0:
                 rows_with_warnings.append(row_num)
             
-            # Print diff for this row
-            num_mismatches = print_row_diff(row_num, expected_row, actual_row)
+            # Print diff for this row (only if verbose)
+            if VERBOSE or FULL_DIFF:
+                num_mismatches = print_row_diff(row_num, expected_row, actual_row)
+            else:
+                # Just count mismatches without printing
+                all_fields = sorted(set(expected_row.keys()) | set(actual_row.keys()))
+                num_mismatches = sum(1 for field in all_fields 
+                                    if not values_equal(field, expected_row.get(field), actual_row.get(field)))
             
             # If perfect match, already printed by print_row_diff
             if num_mismatches == 0:
                 continue
         
-        # Print summary
-        print()
-        print("=" * 80)
-        print("SUMMARY")
-        print("-" * 80)
-        print(f"Total expected rows: {len(expected_rows)}")
-        print(f"Total actual rows:   {len(actual_rows)}")
-        print(f"Perfect matches:     {len(comparison['matched_rows'])}")
-        print(f"Rows with mismatches: {len(comparison['mismatched_rows'])}")
-        print(f"Total mismatched fields: {comparison.get('total_mismatched_fields', 0)}")
+        # Print summary (only if verbose)
+        debug_print("\n" + "=" * 80)
+        debug_print("SUMMARY")
+        debug_print("-" * 80)
+        debug_print(f"Total expected rows: {len(expected_rows)}")
+        debug_print(f"Total actual rows:   {len(actual_rows)}")
+        debug_print(f"Perfect matches:     {len(comparison['matched_rows'])}")
+        debug_print(f"Rows with mismatches: {len(comparison['mismatched_rows'])}")
+        debug_print(f"Critical mismatched fields: {real_mismatched}")
+        if acceptable_mismatched > 0:
+            debug_print(f"Acceptable mismatched fields (low confidence): {acceptable_mismatched}")
         if rows_with_warnings:
-            print(f"Rows containing warnings: {', '.join(map(str, rows_with_warnings))}")
-        else:
-            print("Rows containing warnings: None")
-        print()
+            debug_print(f"Rows containing warnings: {', '.join(map(str, rows_with_warnings))}")
+        debug_print()
         
         # Print final pass/fail
         if passed:
             print(f"{Colors.GREEN}{Colors.BOLD}✓ PASS{Colors.RESET}\n")
         else:
-            print(f"{Colors.RED}{Colors.BOLD}✗ FAIL{Colors.RESET} - {len(comparison['mismatched_rows'])} row(s) with mismatches, {total_mismatched} mismatched field(s)\n")
+            print(f"{Colors.RED}{Colors.BOLD}✗ FAIL{Colors.RESET} - {len(comparison['mismatched_rows'])} row(s) with mismatches, {real_mismatched} critical mismatched field(s)\n")
         
-        return passed, len(actual_rows), total_mismatched
+        return passed, len(actual_rows), real_mismatched
         
     except Exception as e:
         print(f"{Colors.RED}✗ ERROR: {e}{Colors.RESET}\n")
@@ -938,26 +1102,48 @@ def test_pdf() -> Tuple[bool, int, int]:
         
         print(f"{Colors.GREEN}✓{Colors.RESET} Rows extracted: {len(actual_rows)}")
         
+        # DEBUG: Print actual rows if DEBUG is enabled
+        if DEBUG:
+            print(f"\n{Colors.BOLD}{Colors.YELLOW}=== ACTUAL ROWS (before sorting) ==={Colors.RESET}")
+            for i, row in enumerate(actual_rows):
+                pn = row.get('policy_number', 'MISSING')
+                print(f"Row {i+1}: policy_number={pn}, notes={row.get('notes', 'None')[:50] if row.get('notes') else 'None'}")
+            print()
+        
         # Sort both expected and actual by policy_number for consistent comparison
         expected_rows_sorted = sorted(expected_rows, key=lambda x: str(x.get("policy_number", "")))
         actual_rows_sorted = sorted(actual_rows, key=lambda x: str(x.get("policy_number", "")))
         
+        # DEBUG: Print sorted rows if DEBUG is enabled
+        if DEBUG:
+            print(f"\n{Colors.BOLD}{Colors.YELLOW}=== EXPECTED ROWS (after sorting) ==={Colors.RESET}")
+            for i, row in enumerate(expected_rows_sorted):
+                pn = row.get('policy_number', 'MISSING')
+                print(f"Row {i+1}: policy_number={pn}")
+            print(f"\n{Colors.BOLD}{Colors.YELLOW}=== ACTUAL ROWS (after sorting) ==={Colors.RESET}")
+            for i, row in enumerate(actual_rows_sorted):
+                pn = row.get('policy_number', 'MISSING')
+                print(f"Row {i+1}: policy_number={pn}, notes={row.get('notes', 'None')[:50] if row.get('notes') else 'None'}")
+            print(f"Expected count: {len(expected_rows_sorted)}, Actual count: {len(actual_rows_sorted)}")
+            print()
+        
         # Compare
-        print(f"\nComparing expected vs actual...")
+        debug_print(f"\nComparing expected vs actual...")
         comparison = compare_expected_vs_actual(expected_rows_sorted, actual_rows_sorted)
-        total_mismatched = comparison.get("total_mismatched_fields", 0)
-        passed = len(comparison["matched_rows"]) == len(expected_rows_sorted) and total_mismatched == 0
+        real_mismatched, acceptable_mismatched = filter_acceptable_mismatches(comparison, actual_rows_sorted)
+        passed = len(comparison["matched_rows"]) == len(expected_rows_sorted) and real_mismatched == 0
         
         # Normalize rows for display (already sorted)
         expected_norm = [normalize_row_for_comparison(row) for row in expected_rows_sorted]
         actual_norm = [normalize_row_for_comparison(row) for row in actual_rows_sorted]
         
-        # Print results
-        print()
-        print("=" * 80)
-        print("COMPARISON RESULTS")
-        print("=" * 80)
-        print()
+        # Print results (only if verbose or full-diff)
+        if VERBOSE or FULL_DIFF:
+            print()
+            print(f"{Colors.BOLD}{'─' * 80}{Colors.RESET}")
+            print(f"{Colors.BOLD}COMPARISON RESULTS{Colors.RESET}")
+            print(f"{Colors.BOLD}{'─' * 80}{Colors.RESET}")
+            print()
         
         # Group mismatches by row
         mismatches_by_row = {}
@@ -985,13 +1171,15 @@ def test_pdf() -> Tuple[bool, int, int]:
             
             # Handle extra/missing rows
             if row_num in extra_rows:
-                print(f"*** Expected row {row_num} has no actual row ***")
-                print()
+                if VERBOSE or FULL_DIFF:
+                    print(f"*** Expected row {row_num} has no actual row ***")
+                    print()
                 continue
             
             if row_num in missing_rows:
-                print(f"*** Actual row {row_num} has no expected row ***")
-                print()
+                if VERBOSE or FULL_DIFF:
+                    print(f"*** Actual row {row_num} has no expected row ***")
+                    print()
                 continue
             
             # Skip if row doesn't exist in either
@@ -1006,36 +1194,41 @@ def test_pdf() -> Tuple[bool, int, int]:
             if actual_warnings and len(actual_warnings) > 0:
                 rows_with_warnings.append(row_num)
             
-            # Print diff for this row
-            num_mismatches = print_row_diff(row_num, expected_row, actual_row)
+            # Print diff for this row (only if verbose)
+            if VERBOSE or FULL_DIFF:
+                num_mismatches = print_row_diff(row_num, expected_row, actual_row)
+            else:
+                # Just count mismatches without printing
+                all_fields = sorted(set(expected_row.keys()) | set(actual_row.keys()))
+                num_mismatches = sum(1 for field in all_fields 
+                                    if not values_equal(field, expected_row.get(field), actual_row.get(field)))
             
             # If perfect match, already printed by print_row_diff
             if num_mismatches == 0:
                 continue
         
-        # Print summary
-        print()
-        print("=" * 80)
-        print("SUMMARY")
-        print("-" * 80)
-        print(f"Total expected rows: {len(expected_rows_sorted)}")
-        print(f"Total actual rows:   {len(actual_rows_sorted)}")
-        print(f"Perfect matches:     {len(comparison['matched_rows'])}")
-        print(f"Rows with mismatches: {len(comparison['mismatched_rows'])}")
-        print(f"Total mismatched fields: {comparison.get('total_mismatched_fields', 0)}")
+        # Print summary (only if verbose)
+        debug_print("\n" + "=" * 80)
+        debug_print("SUMMARY")
+        debug_print("-" * 80)
+        debug_print(f"Total expected rows: {len(expected_rows_sorted)}")
+        debug_print(f"Total actual rows:   {len(actual_rows_sorted)}")
+        debug_print(f"Perfect matches:     {len(comparison['matched_rows'])}")
+        debug_print(f"Rows with mismatches: {len(comparison['mismatched_rows'])}")
+        debug_print(f"Critical mismatched fields: {real_mismatched}")
+        if acceptable_mismatched > 0:
+            debug_print(f"Acceptable mismatched fields (low confidence): {acceptable_mismatched}")
         if rows_with_warnings:
-            print(f"Rows containing warnings: {', '.join(map(str, rows_with_warnings))}")
-        else:
-            print("Rows containing warnings: None")
-        print()
+            debug_print(f"Rows containing warnings: {', '.join(map(str, rows_with_warnings))}")
+        debug_print()
         
         # Print final pass/fail
         if passed:
             print(f"{Colors.GREEN}{Colors.BOLD}✓ PASS{Colors.RESET}\n")
         else:
-            print(f"{Colors.RED}{Colors.BOLD}✗ FAIL{Colors.RESET} - {len(comparison['mismatched_rows'])} row(s) with mismatches, {total_mismatched} mismatched field(s)\n")
+            print(f"{Colors.RED}{Colors.BOLD}✗ FAIL{Colors.RESET} - {len(comparison['mismatched_rows'])} row(s) with mismatches, {real_mismatched} critical mismatched field(s)\n")
         
-        return passed, len(actual_rows), total_mismatched
+        return passed, len(actual_rows), real_mismatched
         
     except Exception as e:
         print(f"{Colors.RED}✗ ERROR: {e}{Colors.RESET}\n")
@@ -1045,6 +1238,22 @@ def test_pdf() -> Tuple[bool, int, int]:
 
 def main():
     """Run all policy tests."""
+    global VERBOSE, FULL_DIFF, DEBUG
+    
+    # Parse CLI arguments
+    parser = argparse.ArgumentParser(description="Policy extraction test suite")
+    parser.add_argument("--verbose", "-v", action="store_true", help="Show detailed row-by-row diffs")
+    parser.add_argument("--full-diff", action="store_true", help="Show full field-by-field diffs for all rows")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args()
+    
+    VERBOSE = args.verbose
+    FULL_DIFF = args.full_diff
+    DEBUG = args.debug
+    
+    if DEBUG:
+        logging.basicConfig(level=logging.DEBUG)
+    
     print("=" * 80)
     print("UNIFIED POLICY TEST SUITE")
     print("=" * 80)

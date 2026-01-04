@@ -13,6 +13,7 @@ import io
 import json
 
 from .models import OCRMetadata, TextBlock
+from PIL import Image
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +79,7 @@ def extract_text_from_image(
     if image_path.suffix not in valid_extensions:
         raise ValueError(f"Unsupported image format: {image_path.suffix}")
     
-    logger.info(f"[OCR] Extracting text from image: {image_path} (engine: {engine})")
+    logger.warning(f"[OCR] Extracting text from image: {image_path} (engine: {engine})")
     
     # Get image dimensions
     dimensions = _get_image_dimensions(image_path)
@@ -88,18 +89,78 @@ def extract_text_from_image(
     used_engine = "none"
     vision_model = None
     
-    # Try OCR engines in order: Tesseract -> EasyOCR -> Vision -> Fallback
-    if engine == "auto" or engine == "tesseract":
+    # Detect if handwritten from filename (mirrors ENG-101-table-detector line 2121)
+    filename_lower = image_path.name.lower()
+    is_handwritten = any(keyword in filename_lower for keyword in ['handwritten', 'hand', 'scribble', 'notes'])
+    
+    # DPI-aware preprocessing: upscale image if low DPI (mirrors ENG-101-table-detector DPI handling)
+    # This improves OCR quality for images, addressing root cause of null fields
+    original_image_path = image_path
+    temp_file_created = False
+    try:
+        with Image.open(image_path) as img:
+            img_upscaled = _upscale_image_if_low_dpi(img, min_dpi=200)
+            if img_upscaled.size != img.size:
+                # Save upscaled image temporarily for OCR
+                import tempfile
+                import os
+                tmp_file = tempfile.NamedTemporaryFile(suffix='.png', delete=False)
+                img_upscaled.save(tmp_file.name, 'PNG')
+                tmp_file.close()
+                image_path = Path(tmp_file.name)
+                temp_file_created = True
+                logger.debug(f"[OCR] Using upscaled image for better OCR quality")
+    except Exception as e:
+        logger.debug(f"[OCR] Error upscaling image: {e}, using original")
+    
+    # Try OCR engines in order: For handwritten, EasyOCR FIRST (better for handwriting); otherwise Tesseract first
+    # This mirrors ENG-101-table-detector behavior (line 1747-1768)
+    if is_handwritten and (engine == "auto" or engine == "easyocr"):
+        # For handwritten, try EasyOCR FIRST (it's much better for handwriting)
         try:
-            text_blocks, confidence = _extract_with_tesseract(image_path, language, dimensions)
+            text_blocks, confidence = _extract_with_easyocr(image_path, language, dimensions)
+            if text_blocks:
+                used_engine = "easyocr"
+                logger.warning("[OCR] EasyOCR used (handwritten detected, tried first)")
+        except Exception as e:
+            logger.debug(f"[OCR] EasyOCR failed for handwritten: {e}")
+    
+    # Try Tesseract (with PSM fallbacks for handwritten if EasyOCR didn't work)
+    if not text_blocks and (engine == "auto" or engine == "tesseract"):
+        try:
+            text_blocks, confidence = _extract_with_tesseract(
+                image_path, language, dimensions, 
+                is_handwritten=is_handwritten
+            )
             if text_blocks:
                 used_engine = "tesseract"
-                logger.info("[OCR] Tesseract used")
+                logger.warning(f"[OCR] Tesseract completed: {len(text_blocks)} text blocks, avg confidence: {confidence:.1f}")
+            else:
+                logger.warning("[OCR] Tesseract returned no text blocks")
         except Exception as e:
-            logger.debug(f"[OCR] Tesseract failed: {e}")
+            logger.warning(f"[OCR] Tesseract failed: {e}")
     
-    # If Tesseract didn't work, try EasyOCR
-    if not text_blocks and (engine == "auto" or engine == "easyocr"):
+        # If handwritten and Tesseract failed or returned no blocks, try PSM fallbacks
+        # This mirrors ENG-101-table-detector behavior (line 1788-1793)
+        if is_handwritten and not text_blocks:
+            logger.debug("[OCR] Trying Tesseract PSM fallbacks for handwritten...")
+            # Try PSM 11 (sparse text), 12 (sparse with OSD), 13 (raw line)
+            for psm_mode in [11, 12, 13]:
+                try:
+                    text_blocks, confidence = _extract_with_tesseract(
+                        image_path, language, dimensions,
+                        is_handwritten=is_handwritten,
+                        psm_mode=psm_mode
+                    )
+                    if text_blocks:
+                        used_engine = "tesseract"
+                        logger.warning(f"[OCR] Tesseract PSM {psm_mode} succeeded for handwritten: {len(text_blocks)} text blocks")
+                        break
+                except Exception as e:
+                    logger.debug(f"[OCR] Tesseract PSM {psm_mode} failed: {e}")
+    
+    # If Tesseract didn't work and NOT handwritten, try EasyOCR
+    if not text_blocks and not is_handwritten and (engine == "auto" or engine == "easyocr"):
         try:
             text_blocks, confidence = _extract_with_easyocr(image_path, language, dimensions)
             if text_blocks:
@@ -123,6 +184,14 @@ def extract_text_from_image(
         text_blocks, confidence = _extract_fallback_image(image_path, dimensions)
         used_engine = "fallback"
         logger.info("[OCR] Fallback used")
+    
+    # Clean up temporary upscaled image if created
+    if temp_file_created and image_path != original_image_path:
+        try:
+            import os
+            os.unlink(image_path)
+        except Exception as e:
+            logger.debug(f"[OCR] Error cleaning up temp file: {e}")
     
     metadata = OCRMetadata(
         engine=used_engine,
@@ -297,16 +366,96 @@ def _detect_ocr_engine() -> str:
 def _extract_with_tesseract(
     image_path: Path,
     language: str,
-    dimensions: Optional[Tuple[int, int]]
+    dimensions: Optional[Tuple[int, int]],
+    is_handwritten: bool = False,
+    psm_mode: Optional[int] = None
 ) -> Tuple[List[TextBlock], float]:
-    """Extract text using Tesseract OCR."""
+    """
+    Extract text using Tesseract OCR with preprocessing.
+    
+    Mirrors ENG-101-table-detector preprocessing behavior:
+    - Handwritten: denoising + Otsu thresholding + light morphology
+    - Printed: adaptive thresholding + dilation
+    This improves OCR quality before extraction, addressing root cause of null fields.
+    
+    Args:
+        image_path: Path to image file
+        language: Language code for OCR
+        dimensions: Image dimensions (width, height)
+        is_handwritten: Whether image contains handwritten text
+        psm_mode: Tesseract PSM mode (if None, uses default; for handwritten, try 11, 12, 13)
+    """
     import pytesseract
     from PIL import Image
     
-    img = Image.open(image_path)
+    img_original = Image.open(image_path)
+    img = img_original
+    
+    # OCR PREPROCESSING (mirrors ENG-101-table-detector/src/extract_table_and_map_schema.py:1700-1741)
+    # This improves OCR quality, which directly improves extraction accuracy for handwritten/PNG sources
+    # If cv2/numpy not available, skip preprocessing and use original image
+    img_preprocessed = None
+    try:
+        import cv2
+        import numpy as np
+        
+        # Convert to numpy array for preprocessing
+        img_array = np.array(img_original)
+        
+        # Convert to grayscale if needed
+        if len(img_array.shape) == 3:
+            img_gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+        else:
+            img_gray = img_array
+        
+        if is_handwritten:
+            # Handwritten-specific preprocessing (ENG-101: _preprocess_for_handwritten, line 1445)
+            # Denoise first (handwritten text benefits from noise reduction)
+            img_denoised = cv2.fastNlMeansDenoising(img_gray, None, 10, 7, 21)
+            
+            # Use Otsu's threshold instead of adaptive for handwritten (often works better)
+            _, img_thresh = cv2.threshold(img_denoised, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            
+            # Light morphological operations to smooth without losing detail
+            kernel = np.ones((2, 2), np.uint8)
+            img_processed = cv2.morphologyEx(img_thresh, cv2.MORPH_CLOSE, kernel, iterations=1)
+            img_preprocessed = Image.fromarray(img_processed)
+            logger.warning(f"[OCR] Applied handwritten preprocessing (denoise + Otsu + morphology)")
+        else:
+            # Standard preprocessing for printed text (ENG-101: line 1735-1741)
+            img_thresh = cv2.adaptiveThreshold(
+                img_gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
+            )
+            # Apply light dilation (kernel 1x2) to connect characters slightly
+            kernel = np.ones((1, 2), np.uint8)
+            img_dilated = cv2.dilate(img_thresh, kernel, iterations=1)
+            img_preprocessed = Image.fromarray(img_dilated)
+            logger.warning(f"[OCR] Applied printed text preprocessing (adaptive threshold + dilation)")
+    except (ImportError, Exception) as e:
+        # If preprocessing fails (cv2/numpy not available or processing error), use original image
+        logger.warning(f"[OCR] Preprocessing skipped (cv2/numpy unavailable or error): {e}, using original image")
+        img_preprocessed = None
+    
+    # Use preprocessed image if available, otherwise original
+    img = img_preprocessed if img_preprocessed is not None else img_original
+    
+    # Build Tesseract config string
+    # Default PSM: 6 (uniform block of text) for printed, or use provided psm_mode
+    if psm_mode is not None:
+        tesseract_config = f"--oem 3 --psm {psm_mode}"
+    else:
+        tesseract_config = "--oem 3 --psm 6"  # Default for printed text
     
     # Get OCR data with bounding boxes using image_to_data
-    ocr_data = pytesseract.image_to_data(img, lang=language, output_type=pytesseract.Output.DICT)
+    try:
+        ocr_data = pytesseract.image_to_data(img, lang=language, config=tesseract_config, output_type=pytesseract.Output.DICT)
+    except Exception as e:
+        # If preprocessed image fails and we have original, try original (especially for handwritten)
+        if img_preprocessed is not None and is_handwritten:
+            logger.debug(f"[OCR] Preprocessed image failed, trying original: {e}")
+            ocr_data = pytesseract.image_to_data(img_original, lang=language, config=tesseract_config, output_type=pytesseract.Output.DICT)
+        else:
+            raise
     
     text_blocks = []
     current_line = 1
@@ -342,7 +491,7 @@ def _extract_with_tesseract(
             ))
     
     avg_confidence = sum(b.confidence for b in text_blocks) / len(text_blocks) if text_blocks else 0.0
-    logger.debug(f"[OCR] Tesseract extracted {len(text_blocks)} text blocks")
+    logger.warning(f"[OCR] Tesseract extracted {len(text_blocks)} text blocks (avg confidence: {avg_confidence:.1f})")
     return text_blocks, avg_confidence
 
 
@@ -669,9 +818,14 @@ def _extract_from_pdf_images(
         logger.debug("[OCR] pdf2image not available, cannot convert PDF pages to images")
         return [], "none", None
     
+    # Detect if handwritten from filename (mirrors ENG-101-table-detector line 2121)
+    filename_lower = pdf_path.name.lower()
+    is_handwritten = any(keyword in filename_lower for keyword in ['handwritten', 'hand', 'scribble', 'notes'])
+    
     try:
-        # Convert PDF pages to images
-        images = convert_from_path(str(pdf_path), first_page=min(page_numbers) + 1, last_page=max(page_numbers) + 1)
+        # Convert PDF pages to images at ~300 DPI (mirrors ENG-101-table-detector line 1892)
+        # This improves OCR quality for handwritten PDFs by ensuring sufficient resolution
+        images = convert_from_path(str(pdf_path), first_page=min(page_numbers) + 1, last_page=max(page_numbers) + 1, dpi=300)
         
         for idx, page_num in enumerate(page_numbers):
             if idx >= len(images):
@@ -680,22 +834,54 @@ def _extract_from_pdf_images(
             img = images[idx]
             dimensions = img.size
             
-            # Try Tesseract first, then EasyOCR, then Vision if enabled
+            # Try OCR engines: For handwritten, EasyOCR FIRST (better for handwriting); otherwise Tesseract first
+            # This mirrors ENG-101-table-detector behavior (line 1747-1768)
             page_blocks = []
             page_confidence = 0.0
             page_engine = "none"
             page_vision_model = None
             
-            if engine == "auto" or engine == "tesseract":
+            # For handwritten, try EasyOCR FIRST
+            if is_handwritten and (engine == "auto" or engine == "easyocr"):
                 try:
-                    page_blocks, page_confidence = _extract_with_tesseract_image(img, language, dimensions)
+                    page_blocks, page_confidence = _extract_with_easyocr_image(img, language, dimensions)
+                    if page_blocks:
+                        page_engine = "easyocr"
+                        logger.debug(f"[OCR] EasyOCR used for handwritten PDF page {page_num + 1} (tried first)")
+                except Exception as e:
+                    logger.debug(f"[OCR] EasyOCR failed for handwritten PDF page {page_num + 1}: {e}")
+            
+            # Try Tesseract (with PSM fallbacks for handwritten if EasyOCR didn't work)
+            if not page_blocks and (engine == "auto" or engine == "tesseract"):
+                try:
+                    page_blocks, page_confidence = _extract_with_tesseract_image(img, language, dimensions, is_handwritten=is_handwritten)
                     if page_blocks:
                         page_engine = "tesseract"
                         logger.debug(f"[OCR] Tesseract used for PDF page {page_num + 1}")
+                    else:
+                        logger.debug(f"[OCR] Tesseract returned no blocks for PDF page {page_num + 1}")
                 except Exception as e:
                     logger.debug(f"[OCR] Tesseract failed for page {page_num + 1}: {e}")
             
-            if not page_blocks and (engine == "auto" or engine == "easyocr"):
+                # If handwritten and Tesseract failed or returned no blocks, try PSM fallbacks
+                if is_handwritten and not page_blocks:
+                    logger.debug(f"[OCR] Trying Tesseract PSM fallbacks for handwritten PDF page {page_num + 1}...")
+                    for psm_mode in [11, 12, 13]:
+                        try:
+                            page_blocks, page_confidence = _extract_with_tesseract_image(
+                                img, language, dimensions,
+                                is_handwritten=is_handwritten,
+                                psm_mode=psm_mode
+                            )
+                            if page_blocks:
+                                page_engine = "tesseract"
+                                logger.debug(f"[OCR] Tesseract PSM {psm_mode} succeeded for handwritten PDF page {page_num + 1}")
+                                break
+                        except Exception as e:
+                            logger.debug(f"[OCR] Tesseract PSM {psm_mode} failed for PDF page {page_num + 1}: {e}")
+            
+            # If Tesseract didn't work and NOT handwritten, try EasyOCR
+            if not page_blocks and not is_handwritten and (engine == "auto" or engine == "easyocr"):
                 try:
                     page_blocks, page_confidence = _extract_with_easyocr_image(img, language, dimensions)
                     if page_blocks:
@@ -738,13 +924,95 @@ def _extract_from_pdf_images(
 def _extract_with_tesseract_image(
     img,
     language: str,
-    dimensions: Optional[Tuple[int, int]]
+    dimensions: Optional[Tuple[int, int]],
+    is_handwritten: bool = False,
+    psm_mode: Optional[int] = None
 ) -> Tuple[List[TextBlock], float]:
-    """Extract text from PIL Image using Tesseract OCR."""
+    """
+    Extract text from PIL Image using Tesseract OCR with preprocessing.
+    
+    Mirrors ENG-101-table-detector preprocessing behavior:
+    - Handwritten: denoising + Otsu thresholding + light morphology
+    - Printed: adaptive thresholding + dilation
+    This improves OCR quality before extraction, addressing root cause of null fields.
+    
+    Args:
+        img: PIL Image object
+        language: Language code for OCR
+        dimensions: Image dimensions (width, height)
+        is_handwritten: Whether image contains handwritten text
+        psm_mode: Tesseract PSM mode (if None, uses default; for handwritten, try 11, 12, 13)
+    """
     import pytesseract
+    from PIL import Image
+    
+    img_original = img.copy()
+    img_processed = None
+    
+    # OCR PREPROCESSING (mirrors ENG-101-table-detector/src/extract_table_and_map_schema.py:1700-1741)
+    # This improves OCR quality, which directly improves extraction accuracy for handwritten/PNG sources
+    # If cv2/numpy not available, skip preprocessing and use original image
+    try:
+        import cv2
+        import numpy as np
+        
+        # Convert to numpy array for preprocessing
+        img_array = np.array(img_original)
+        
+        # Convert to grayscale if needed
+        if len(img_array.shape) == 3:
+            img_gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+        else:
+            img_gray = img_array
+        
+        if is_handwritten:
+            # Handwritten-specific preprocessing (ENG-101: _preprocess_for_handwritten, line 1445)
+            # Denoise first (handwritten text benefits from noise reduction)
+            img_denoised = cv2.fastNlMeansDenoising(img_gray, None, 10, 7, 21)
+            
+            # Use Otsu's threshold instead of adaptive for handwritten (often works better)
+            _, img_thresh = cv2.threshold(img_denoised, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            
+            # Light morphological operations to smooth without losing detail
+            kernel = np.ones((2, 2), np.uint8)
+            img_processed_array = cv2.morphologyEx(img_thresh, cv2.MORPH_CLOSE, kernel, iterations=1)
+            img_processed = Image.fromarray(img_processed_array)
+            logger.warning(f"[OCR] Applied handwritten preprocessing (denoise + Otsu + morphology)")
+        else:
+            # Standard preprocessing for printed text (ENG-101: line 1735-1741)
+            img_thresh = cv2.adaptiveThreshold(
+                img_gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
+            )
+            # Apply light dilation (kernel 1x2) to connect characters slightly
+            kernel = np.ones((1, 2), np.uint8)
+            img_dilated = cv2.dilate(img_thresh, kernel, iterations=1)
+            img_processed = Image.fromarray(img_dilated)
+            logger.warning(f"[OCR] Applied printed text preprocessing (adaptive threshold + dilation)")
+    except (ImportError, Exception) as e:
+        # If preprocessing fails (cv2/numpy not available or processing error), use original image
+        logger.warning(f"[OCR] Preprocessing skipped (cv2/numpy unavailable or error): {e}, using original image")
+        img_processed = None
+    
+    # Use preprocessed image if available, otherwise original
+    img = img_processed if img_processed is not None else img_original
+    
+    # Build Tesseract config string
+    # Default PSM: 6 (uniform block of text) for printed, or use provided psm_mode
+    if psm_mode is not None:
+        tesseract_config = f"--oem 3 --psm {psm_mode}"
+    else:
+        tesseract_config = "--oem 3 --psm 6"  # Default for printed text
     
     # Get OCR data with bounding boxes
-    ocr_data = pytesseract.image_to_data(img, lang=language, output_type=pytesseract.Output.DICT)
+    try:
+        ocr_data = pytesseract.image_to_data(img, lang=language, config=tesseract_config, output_type=pytesseract.Output.DICT)
+    except Exception as e:
+        # If preprocessed image fails and we have original, try original (especially for handwritten)
+        if img_processed is not None and is_handwritten:
+            logger.debug(f"[OCR] Preprocessed image failed, trying original: {e}")
+            ocr_data = pytesseract.image_to_data(img_original, lang=language, config=tesseract_config, output_type=pytesseract.Output.DICT)
+        else:
+            raise
     
     text_blocks = []
     current_line = 1
@@ -1039,7 +1307,9 @@ def _extract_from_pdf_vision(
     vision_model = None
     
     try:
-        images = convert_from_path(str(pdf_path), first_page=min(page_numbers) + 1, last_page=max(page_numbers) + 1)
+        # Convert PDF pages to images at ~300 DPI (mirrors ENG-101-table-detector line 1892)
+        # This improves Vision API quality for handwritten PDFs by ensuring sufficient resolution
+        images = convert_from_path(str(pdf_path), first_page=min(page_numbers) + 1, last_page=max(page_numbers) + 1, dpi=300)
         
         for idx, page_num in enumerate(page_numbers):
             if idx >= len(images):
@@ -1062,6 +1332,42 @@ def _extract_from_pdf_vision(
     return text_blocks, avg_confidence, vision_model
 
 
+def _upscale_image_if_low_dpi(img: Image.Image, min_dpi: int = 200) -> Image.Image:
+    """
+    Upscale image if DPI is below threshold (mirrors ENG-101-table-detector DPI handling).
+    
+    For images with low DPI, upscaling improves OCR quality before extraction.
+    This addresses root cause of null fields by ensuring sufficient resolution.
+    
+    Args:
+        img: PIL Image to check/upscale
+        min_dpi: Minimum DPI threshold (default: 200)
+    
+    Returns:
+        Original or upscaled PIL Image
+    """
+    try:
+        # Estimate DPI from image dimensions (rough heuristic)
+        # For typical document sizes, assume 8.5x11 inches if dimensions suggest document
+        width, height = img.size
+        
+        # Heuristic: if image is small (< 2000px width), likely low DPI
+        # Upscale by factor to reach ~200 DPI equivalent
+        if width < 2000:
+            # Calculate upscale factor to reach ~200 DPI equivalent
+            # Assuming original is ~72-100 DPI, upscale by ~2-3x
+            scale_factor = max(2.0, 2000 / width)
+            new_width = int(width * scale_factor)
+            new_height = int(height * scale_factor)
+            
+            logger.debug(f"[OCR] Upscaling image from {width}x{height} to {new_width}x{new_height} (estimated DPI improvement)")
+            return img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+    except Exception as e:
+        logger.debug(f"[OCR] Error upscaling image: {e}, using original")
+    
+    return img
+
+
 def _get_image_dimensions(image_path: Path) -> Optional[Tuple[int, int]]:
     """
     Get image dimensions (width, height) in pixels.
@@ -1073,7 +1379,6 @@ def _get_image_dimensions(image_path: Path) -> Optional[Tuple[int, int]]:
         Tuple of (width, height) or None if unable to read
     """
     try:
-        from PIL import Image
         with Image.open(image_path) as img:
             return img.size
     except ImportError:

@@ -151,49 +151,6 @@ DRIVERS_MAPPINGS = [
                 "type": "string",
                 "required": False
             },
-            # Address1 - multiple variants (CSV: "Address Line 1", Airtable: "Address 1")
-            {
-                "target_field": "address1",
-                "source_field": "Address Line 1",
-                "type": "string",
-                "required": False
-            },
-            {
-                "target_field": "address1",
-                "source_field": "Address 1",
-                "type": "string",
-                "required": False
-            },
-            {
-                "target_field": "city",
-                "source_field": "City",
-                "type": "string",
-                "required": False
-            },
-            {
-                "target_field": "state",
-                "source_field": "State",
-                "type": "string",
-                "required": False,
-                "validation": {
-                    "min_length": 2,
-                    "max_length": 2
-                }
-                # "transform": "uppercase"  # Transform logic will be implemented later
-            },
-            # ZIP - multiple variants (CSV: "Postal Code", Airtable: "ZIP")
-            {
-                "target_field": "zip",
-                "source_field": "Postal Code",
-                "type": "string",
-                "required": False
-            },
-            {
-                "target_field": "zip",
-                "source_field": "ZIP",
-                "type": "string",
-                "required": False
-            },
             # Primary Driver - multiple variants (CSV: "Primary Driver?", Airtable: "Primary Driver")
             {
                 "target_field": "primary_driver",
@@ -349,31 +306,6 @@ DRIVERS_MAPPINGS = [
                 "required": False
             },
             {
-                "target_field": "address1",
-                "source_field": "Address 1",
-                "type": "string",
-                "required": False
-            },
-            {
-                "target_field": "city",
-                "source_field": "City",
-                "type": "string",
-                "required": False
-            },
-            {
-                "target_field": "state",
-                "source_field": "State",
-                "type": "string",
-                "required": False
-                # "transform": "uppercase"  # Transform logic will be implemented later
-            },
-            {
-                "target_field": "zip",
-                "source_field": "ZIP",
-                "type": "string",
-                "required": False
-            },
-            {
                 "target_field": "primary_driver",
                 "source_field": "Primary Driver",
                 "type": "string",
@@ -442,6 +374,12 @@ DRIVERS_MAPPINGS = [
                 "required": False
             },
             {
+                "target_field": "date_of_birth",
+                "source_field": "DOB",
+                "type": "date",
+                "required": False
+            },
+            {
                 "target_field": "gender",
                 "source_field": "GENDER",
                 "type": "string",
@@ -487,30 +425,6 @@ DRIVERS_MAPPINGS = [
             {
                 "target_field": "phone",
                 "source_field": "PHONE",
-                "type": "string",
-                "required": False
-            },
-            {
-                "target_field": "address1",
-                "source_field": "ADDRESS_LINE_1",
-                "type": "string",
-                "required": False
-            },
-            {
-                "target_field": "city",
-                "source_field": "CITY",
-                "type": "string",
-                "required": False
-            },
-            {
-                "target_field": "state",
-                "source_field": "STATE",
-                "type": "string",
-                "required": False
-            },
-            {
-                "target_field": "zip",
-                "source_field": "POSTAL_CODE",
                 "type": "string",
                 "required": False
             },
@@ -651,34 +565,6 @@ DRIVERS_MAPPINGS = [
                 "type": "string",
                 "required": False,
                 "ai_instruction": "Extract the driver's phone number from the document. Look for labels like 'Phone', 'Phone Number', 'Contact', 'Telephone', 'Cell', or phone number patterns (XXX-XXX-XXXX, (XXX) XXX-XXXX, etc.)."
-            },
-            {
-                "target_field": "address1",
-                "source_field": "",
-                "type": "string",
-                "required": False,
-                "ai_instruction": "Extract the driver's street address (first line) from the document. Look for labels like 'Address', 'Address Line 1', 'Street Address', 'Address 1', or street addresses near location information."
-            },
-            {
-                "target_field": "city",
-                "source_field": "",
-                "type": "string",
-                "required": False,
-                "ai_instruction": "Extract the driver's city from the document. Look for labels like 'City', or city names in address sections."
-            },
-            {
-                "target_field": "state",
-                "source_field": "",
-                "type": "string",
-                "required": False,
-                "ai_instruction": "Extract the driver's state from the document. Look for labels like 'State', or state abbreviations (2 letters) in address sections."
-            },
-            {
-                "target_field": "zip",
-                "source_field": "",
-                "type": "string",
-                "required": False,
-                "ai_instruction": "Extract the driver's ZIP or postal code from the document. Look for labels like 'ZIP', 'Postal Code', 'ZIP Code', or postal codes (5 or 9 digits) in address sections."
             },
             {
                 "target_field": "primary_driver",

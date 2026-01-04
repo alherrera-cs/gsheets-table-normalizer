@@ -31,17 +31,6 @@
       "status": "closed",
       "notes": null,
       "_warnings": []
-    },
-    {
-      "claim_number": "C003",
-      "policy_number": null,
-      "loss_date": "2024-02-15",
-      "claim_type": "theft",
-      "amount": 15000.0,
-      "description": "Vehicle theft",
-      "status": "denied",
-      "notes": "Unstructured claim text",
-      "_warnings": []
     }
   ]
 }

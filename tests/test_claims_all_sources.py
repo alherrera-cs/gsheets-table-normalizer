@@ -6,14 +6,21 @@ Tests all claims formats in a single suite:
 - Unstructured: PDF, Raw Text, Image (stubs for now)
 """
 
-# DEBUG MODE TOGGLE - Set to True to see raw JSON dumps
-DEBUG = False
-
 import sys
 import json
 import traceback
+import logging
+import argparse
 from pathlib import Path
 from typing import Dict, Any, List, Tuple
+
+# Global flags for output control
+VERBOSE = False
+FULL_DIFF = False
+DEBUG = False
+
+# Suppress debug logs during test runs for cleaner output (unless VERBOSE)
+logging.getLogger().setLevel(logging.WARNING)
 
 # ANSI color codes for terminal output
 class Colors:
@@ -35,6 +42,12 @@ sys.path.insert(0, str(SRC))
 from normalizer import normalize_v2
 from mappings import get_mapping_by_id
 from schema import reorder_all_claims, CLAIM_SCHEMA_ORDER
+
+
+def debug_print(*args, **kwargs):
+    """Print only if VERBOSE is enabled."""
+    if VERBOSE:
+        print(*args, **kwargs)
 
 
 def load_truth_file(truth_file: Path) -> List[Dict[str, Any]]:
@@ -176,11 +189,13 @@ def compare_expected_vs_actual(expected_rows: List[Dict[str, Any]], actual_rows:
     
     for i in range(max_rows):
         if i >= len(expected_rows):
-            print(f"{Colors.RED}*** Actual row {i+1} has no expected row ***{Colors.RESET}")
+            if VERBOSE or FULL_DIFF:
+                print(f"{Colors.RED}*** Actual row {i+1} has no expected row ***{Colors.RESET}")
             mismatched_rows.append(i+1)
             continue
         if i >= len(actual_rows):
-            print(f"{Colors.RED}*** Expected row {i+1} has no actual row ***{Colors.RESET}")
+            if VERBOSE or FULL_DIFF:
+                print(f"{Colors.RED}*** Expected row {i+1} has no actual row ***{Colors.RESET}")
             mismatched_rows.append(i+1)
             continue
         
@@ -208,13 +223,15 @@ def compare_expected_vs_actual(expected_rows: List[Dict[str, Any]], actual_rows:
         
         if row_mismatches:
             mismatched_rows.append(i+1)
-            print_row_diff(i+1, expected, actual, row_mismatches)
+            if VERBOSE or FULL_DIFF:
+                print_row_diff(i+1, expected, actual, row_mismatches)
         else:
             matched_rows.append(i+1)
-            if actual.get("_warnings"):
-                print(f"{Colors.GREEN}Row {i+1}: ✓ PERFECT MATCH (with warnings){Colors.RESET}")
-            else:
-                print(f"{Colors.GREEN}Row {i+1}: ✓ PERFECT MATCH{Colors.RESET}")
+            if VERBOSE or FULL_DIFF:
+                if actual.get("_warnings"):
+                    print(f"{Colors.GREEN}Row {i+1}: ✓ PERFECT MATCH (with warnings){Colors.RESET}")
+                else:
+                    print(f"{Colors.GREEN}Row {i+1}: ✓ PERFECT MATCH{Colors.RESET}")
     
     return {
         "matched_rows": matched_rows,
@@ -266,7 +283,7 @@ def test_google_sheet() -> Tuple[bool, int, int]:
         actual_rows_sorted = sorted(actual_rows, key=lambda x: str(x.get("claim_number", "")))
         
         # Compare
-        print(f"\nComparing expected vs actual...")
+        debug_print(f"\nComparing expected vs actual...")
         comparison = compare_expected_vs_actual(expected_rows_sorted, actual_rows_sorted)
         total_mismatched = comparison.get("total_mismatched_fields", 0)
         passed = len(comparison["matched_rows"]) == len(expected_rows_sorted) and total_mismatched == 0
@@ -281,19 +298,18 @@ def test_google_sheet() -> Tuple[bool, int, int]:
             if row.get("_warnings")
         ]
         
-        print(f"\n{Colors.BOLD}{Colors.CYAN}{'='*80}{Colors.RESET}")
-        print(f"{Colors.BOLD}{Colors.CYAN}SUMMARY{Colors.RESET}")
-        print(f"{Colors.GRAY}{'-'*80}{Colors.RESET}")
-        print(f"Total expected rows: {len(expected_rows_sorted)}")
-        print(f"Total actual rows:   {len(actual_rows_sorted)}")
-        print(f"Perfect matches:     {len(comparison['matched_rows'])}")
-        print(f"Rows with mismatches: {len(comparison['mismatched_rows'])}")
-        print(f"Total mismatched fields: {total_mismatched}")
+        # Print summary (only if verbose)
+        debug_print("\n" + "=" * 80)
+        debug_print("SUMMARY")
+        debug_print("-" * 80)
+        debug_print(f"Total expected rows: {len(expected_rows_sorted)}")
+        debug_print(f"Total actual rows:   {len(actual_rows_sorted)}")
+        debug_print(f"Perfect matches:     {len(comparison['matched_rows'])}")
+        debug_print(f"Rows with mismatches: {len(comparison['mismatched_rows'])}")
+        debug_print(f"Total mismatched fields: {total_mismatched}")
         if rows_with_warnings:
-            print(f"Rows containing warnings: {', '.join(map(str, rows_with_warnings))}")
-        else:
-            print("Rows containing warnings: None")
-        print()
+            debug_print(f"Rows containing warnings: {', '.join(map(str, rows_with_warnings))}")
+        debug_print()
         
         # Print final pass/fail
         if passed:
@@ -368,7 +384,7 @@ def test_pdf() -> Tuple[bool, int, int]:
         actual_rows_sorted = sorted(actual_rows, key=lambda x: str(x.get("claim_number", "")))
         
         # Compare
-        print(f"\nComparing expected vs actual...")
+        debug_print(f"\nComparing expected vs actual...")
         comparison = compare_expected_vs_actual(expected_rows_sorted, actual_rows_sorted)
         total_mismatched = comparison.get("total_mismatched_fields", 0)
         passed = len(comparison["matched_rows"]) == len(expected_rows) and total_mismatched == 0
@@ -379,10 +395,13 @@ def test_pdf() -> Tuple[bool, int, int]:
         
         # Print results
         print()
-        print("=" * 80)
-        print("COMPARISON RESULTS")
-        print("=" * 80)
-        print()
+        # Print results (only if verbose or full-diff)
+        if VERBOSE or FULL_DIFF:
+            print()
+            print(f"{Colors.BOLD}{'─' * 80}{Colors.RESET}")
+            print(f"{Colors.BOLD}COMPARISON RESULTS{Colors.RESET}")
+            print(f"{Colors.BOLD}{'─' * 80}{Colors.RESET}")
+            print()
         
         # Group mismatches by row
         mismatches_by_row = {}
@@ -410,13 +429,15 @@ def test_pdf() -> Tuple[bool, int, int]:
             
             # Handle extra/missing rows
             if row_num in extra_rows:
-                print(f"*** Expected row {row_num} has no actual row ***")
-                print()
+                if VERBOSE or FULL_DIFF:
+                    print(f"*** Expected row {row_num} has no actual row ***")
+                    print()
                 continue
             
             if row_num in missing_rows:
-                print(f"*** Actual row {row_num} has no expected row ***")
-                print()
+                if VERBOSE or FULL_DIFF:
+                    print(f"*** Actual row {row_num} has no expected row ***")
+                    print()
                 continue
             
             # Skip if row doesn't exist in either
@@ -431,32 +452,30 @@ def test_pdf() -> Tuple[bool, int, int]:
             if actual_warnings and len(actual_warnings) > 0:
                 rows_with_warnings.append(row_num)
             
-            # Print diff for this row
-            mismatches = []
-            all_fields = set(expected_row.keys()) | set(actual_row.keys())
-            for field in all_fields:
-                if field in ["_source_id", "_source_row_number", "_id"]:
-                    continue
-                if not values_equal(field, expected_row.get(field), actual_row.get(field)):
-                    mismatches.append({"field": field})
-            
-            print_row_diff(row_num, expected_row, actual_row, mismatches)
+            # Print diff for this row (only if verbose)
+            if VERBOSE or FULL_DIFF:
+                mismatches = []
+                all_fields = set(expected_row.keys()) | set(actual_row.keys())
+                for field in all_fields:
+                    if field in ["_source_id", "_source_row_number", "_id"]:
+                        continue
+                    if not values_equal(field, expected_row.get(field), actual_row.get(field)):
+                        mismatches.append({"field": field})
+                
+                print_row_diff(row_num, expected_row, actual_row, mismatches)
         
-        # Print summary
-        print()
-        print("=" * 80)
-        print("SUMMARY")
-        print("-" * 80)
-        print(f"Total expected rows: {len(expected_rows_sorted)}")
-        print(f"Total actual rows:   {len(actual_rows_sorted)}")
-        print(f"Perfect matches:     {len(comparison['matched_rows'])}")
-        print(f"Rows with mismatches: {len(comparison['mismatched_rows'])}")
-        print(f"Total mismatched fields: {comparison.get('total_mismatched_fields', 0)}")
+        # Print summary (only if verbose)
+        debug_print("\n" + "=" * 80)
+        debug_print("SUMMARY")
+        debug_print("-" * 80)
+        debug_print(f"Total expected rows: {len(expected_rows_sorted)}")
+        debug_print(f"Total actual rows:   {len(actual_rows_sorted)}")
+        debug_print(f"Perfect matches:     {len(comparison['matched_rows'])}")
+        debug_print(f"Rows with mismatches: {len(comparison['mismatched_rows'])}")
+        debug_print(f"Total mismatched fields: {comparison.get('total_mismatched_fields', 0)}")
         if rows_with_warnings:
-            print(f"Rows containing warnings: {', '.join(map(str, rows_with_warnings))}")
-        else:
-            print("Rows containing warnings: None")
-        print()
+            debug_print(f"Rows containing warnings: {', '.join(map(str, rows_with_warnings))}")
+        debug_print()
         
         # Print final pass/fail
         if passed:
@@ -474,9 +493,26 @@ def test_pdf() -> Tuple[bool, int, int]:
 
 def main():
     """Run all claims tests."""
-    print(f"{Colors.BOLD}{Colors.CYAN}{'='*80}{Colors.RESET}")
-    print(f"{Colors.BOLD}{Colors.CYAN}UNIFIED CLAIMS TEST SUITE{Colors.RESET}")
-    print(f"{Colors.BOLD}{Colors.CYAN}{'='*80}{Colors.RESET}\n")
+    global VERBOSE, FULL_DIFF, DEBUG
+    
+    # Parse CLI arguments
+    parser = argparse.ArgumentParser(description="Claims extraction test suite")
+    parser.add_argument("--verbose", "-v", action="store_true", help="Show detailed row-by-row diffs")
+    parser.add_argument("--full-diff", action="store_true", help="Show full field-by-field diffs for all rows")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args()
+    
+    VERBOSE = args.verbose
+    FULL_DIFF = args.full_diff
+    DEBUG = args.debug
+    
+    if DEBUG:
+        logging.basicConfig(level=logging.DEBUG)
+    
+    print("=" * 80)
+    print("UNIFIED CLAIMS TEST SUITE")
+    print("=" * 80)
+    print()
     
     results = []
     

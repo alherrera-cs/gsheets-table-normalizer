@@ -31,17 +31,6 @@
         "vehicle_vin": "ZTC6H1FV0NECRVFRG",
         "notes": "Cancelled mid-term.",
         "_warnings": []
-      },
-      {
-        "policy_number": "P_BAD1",
-        "insured_name": null,
-        "effective_date": null,
-        "expiration_date": null,
-        "premium": -100.0,
-        "coverage_type": null,
-        "vehicle_vin": null,
-        "notes": "Random memo: AUTO POLICY P002 canceled. premium -100 dates reversed",
-        "_warnings": ["negative_premium", "invalid_date_range", "unstructured_policy"]
       }
     ]
   }

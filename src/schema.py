@@ -249,14 +249,25 @@ def reorder_driver_fields(row: Dict[str, Any]) -> Dict[str, Any]:
     """
     Reorder row keys to match DRIVER_SCHEMA_ORDER exactly.
     
-    Missing fields become None; extra fields are appended at the bottom.
+    Missing fields become None; extra fields are filtered out (only canonical schema fields kept).
+    Metadata fields (_confidence, _warnings, _source, _flags, etc.) are preserved.
     """
     ordered = {field: row.get(field) for field in DRIVER_SCHEMA_ORDER}
     
-    # Preserve unexpected fields (debugging-friendly)
-    for key in row:
-        if key not in ordered:
-            ordered[key] = row[key]
+    # Preserve metadata fields (not in DRIVER_SCHEMA_ORDER)
+    metadata_fields = ["_confidence", "_warnings", "_source", "_flags", "_source_id", "_source_row_number", "_id"]
+    for metadata_field in metadata_fields:
+        if metadata_field in row:
+            ordered[metadata_field] = row[metadata_field]
+    
+    # Ensure _warnings and _confidence always exist (even if empty or None)
+    if "_warnings" not in ordered or ordered.get("_warnings") is None or not isinstance(ordered.get("_warnings"), list):
+        ordered["_warnings"] = []
+    if "_confidence" not in ordered or ordered.get("_confidence") is None or not isinstance(ordered.get("_confidence"), dict):
+        ordered["_confidence"] = {}
+    
+    # Do NOT preserve unexpected non-canonical fields - only keep canonical DRIVER_SCHEMA_ORDER fields
+    # This matches vehicle behavior where only canonical schema fields are kept
     
     return ordered
 
@@ -290,14 +301,19 @@ def reorder_relationship_fields(row: Dict[str, Any]) -> Dict[str, Any]:
     """
     Reorder row keys to match RELATIONSHIP_SCHEMA_ORDER exactly.
     
-    Missing fields become None; extra fields are appended at the bottom.
+    Missing fields become None; extra fields are filtered out (only canonical schema fields kept).
+    Metadata fields (_confidence, _warnings, _source, _flags, etc.) are preserved.
     """
     ordered = {field: row.get(field) for field in RELATIONSHIP_SCHEMA_ORDER}
     
-    # Preserve unexpected fields (debugging-friendly)
-    for key in row:
-        if key not in ordered:
-            ordered[key] = row[key]
+    # Preserve metadata fields (not in RELATIONSHIP_SCHEMA_ORDER)
+    metadata_fields = ["_confidence", "_warnings", "_source", "_flags", "_source_id", "_source_row_number", "_id"]
+    for metadata_field in metadata_fields:
+        if metadata_field in row:
+            ordered[metadata_field] = row[metadata_field]
+    
+    # Do NOT preserve unexpected non-canonical fields - only keep canonical RELATIONSHIP_SCHEMA_ORDER fields
+    # This matches driver behavior where only canonical schema fields are kept
     
     return ordered
 

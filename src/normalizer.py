@@ -5,7 +5,7 @@ Supports new mapping structure with metadata, mappings array, and AI instruction
 Transform logic will be implemented in a future update.
 """
 
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 from pathlib import Path
 import uuid
 import re
@@ -21,8 +21,6 @@ from external_tables import (
     clean_header,
     normalize_header,
     rows2d_to_objects,
-    normalize_values,
-    drop_empty_rows,
 )
 from inference import (
     apply_fallback_inference,
@@ -33,7 +31,6 @@ from inference import (
     detect_year_in_row,
     detect_make_model_in_row,
 )
-
 
 def clean_none(value: Any) -> Optional[str]:
     """
@@ -50,11 +47,9 @@ def clean_none(value: Any) -> Optional[str]:
     text = str(value).strip()
     return None if text.lower() == "none" else text
 
-
 class NormalizationError(Exception):
     """Raised when normalization fails."""
     pass
-
 
 def _calculate_header_similarity(header1: str, header2: str) -> float:
     """
@@ -81,7 +76,6 @@ def _calculate_header_similarity(header1: str, header2: str) -> float:
     similarity = 1.0 - (distance / max_len)
     
     return similarity
-
 
 # ============================================================================
 # Internal Helper Functions for normalize_v2
@@ -114,7 +108,6 @@ def _apply_simple_transform(transform: str, value: Any) -> Any:
             return value_str  # Keep original if not recognized
     
     return value
-
 
 def _normalize_value(target_field: str, value: Any) -> Any:
     """
@@ -154,7 +147,6 @@ def _normalize_value(target_field: str, value: Any) -> Any:
     
     return value
 
-
 def _prepare_rows(raw_data: List[List[Any]], header_row_index: int, file_is_headerless: bool) -> List[Dict[str, Any]]:
     """
     Prepare rows from raw 2D data, handling both headerless and normal files.
@@ -180,7 +172,6 @@ def _prepare_rows(raw_data: List[List[Any]], header_row_index: int, file_is_head
         # rows2d_to_objects() now uses normalize_header() internally, so all headers
         # are already normalized when the row dictionaries are created
         return rows2d_to_objects(raw_data, header_row_index=header_row_index)
-
 
 def promote_fields_from_notes(row_result: Dict[str, Any]) -> None:
     """
@@ -253,6 +244,401 @@ def promote_fields_from_notes(row_result: Dict[str, Any]) -> None:
             except (ValueError, TypeError):
                 pass
 
+def infer_fields_from_notes_for_vision(row_result: Dict[str, Any], row: Dict[str, Any]) -> List[str]:
+    """
+    Post-Vision inference: Extract semantic fields from notes/text for Vision-extracted rows.
+    
+    This function fills missing fields (body_style, fuel_type, transmission, mileage, color, owner_email)
+    by searching the notes field and all row fields for keywords/patterns.
+    
+    Args:
+        row_result: The normalized row result dictionary (will be modified in place)
+        row: The original row dictionary (for scanning all fields for email)
+    
+    Returns:
+        List of warning strings for fields that were inferred (e.g., ["inferred_body_style_from_notes"])
+    """
+    warnings = []
+    
+    # Get notes text - try from row_result first, then from row
+    notes = row_result.get("notes") or row.get("notes")
+    if not notes or not isinstance(notes, str):
+        notes = ""
+    
+    # Also check for OCR text in row (for Vision-extracted rows that might have OCR text available)
+    ocr_text = row.get("_ocr_text") or row.get("ocr_text") or ""
+    
+    # Combine notes, OCR text, and all text fields from row for comprehensive search
+    all_text = notes
+    if ocr_text:
+        all_text += " " + ocr_text
+    for key, val in row.items():
+        if isinstance(val, str) and val and key not in ["vin", "year", "make", "model"] and not key.startswith("_"):
+            all_text += " " + val
+    
+    text_lower = all_text.lower()
+    
+    # Debug logging (only if we have text to search)
+    if all_text.strip():
+        import logging
+        logger = logging.getLogger(__name__)
+        # Enhanced logging to see full OCR text for debugging
+        missing_fields = [f for f in ["body_style", "fuel_type", "transmission", "mileage", "color", "owner_email"] 
+                         if row_result.get(f) is None]
+        if missing_fields:
+            logger.warning(f"[Post-Vision Inference] Searching text ({len(all_text)} chars) for missing fields: {missing_fields}")
+            logger.warning(f"[Post-Vision Inference] Full text being searched: {all_text}")
+            # Check if keywords are present
+            keywords_to_check = {
+                'body_style': ['sedan', 'truck', 'suv', 'coupe', 'van', 'sed', 'truc'],
+                'fuel_type': ['gas', 'gasoline', 'gasolin', 'diesel', 'electric'],
+                'transmission': ['automatic', 'auto', 'manual', 'automat'],
+                'mileage': ['mileage', 'milage', 'miles', 'mages', '100', '1000'],
+                'color': ['blue', 'red', 'green', 'bive', 'ved']
+            }
+            for field in missing_fields:
+                if field in keywords_to_check:
+                    found_keywords = [kw for kw in keywords_to_check[field] if kw in text_lower]
+                    if found_keywords:
+                        logger.warning(f"[Post-Vision Inference] Found keywords for {field}: {found_keywords}")
+                    else:
+                        logger.warning(f"[Post-Vision Inference] NO keywords found for {field} in text")
+    
+    # Extract body_style if None
+    # Handle fragmented OCR text by searching for partial matches (e.g., "sed" + "an" = "sedan")
+    if row_result.get("body_style") is None:
+        body_styles = ['sedan', 'truck', 'suv', 'crossover', 'coupe', 'convertible', 'wagon', 'hatchback', 'van']
+        # First try exact word boundary match
+        for style in body_styles:
+            if re.search(rf'\b{re.escape(style)}\b', text_lower):
+                row_result["body_style"] = style
+                warnings.append("inferred_body_style_from_notes")
+                break
+        # If no exact match, try fragmented OCR (search for key parts of words)
+        if row_result.get("body_style") is None:
+            # For fragmented OCR, search for distinctive parts
+            fragmented_patterns = {
+                'sedan': r'(sed|sedan)',
+                'truck': r'(truck|truc|pickup)',
+                'suv': r'\b(suv|s\.u\.v)',
+                'coupe': r'(coupe|coupe)',
+                'van': r'\b(van)\b',
+            }
+            for style, pattern in fragmented_patterns.items():
+                if re.search(pattern, text_lower):
+                    row_result["body_style"] = style
+                    warnings.append("inferred_body_style_from_notes")
+                    break
+        
+        # If still not found, try model-based inference (infer from make/model)
+        if row_result.get("body_style") is None:
+            make = (row_result.get("make") or row.get("make") or "").lower()
+            model = (row_result.get("model") or row.get("model") or "").lower()
+            
+            # Model-based inference: common vehicle types
+            if make and model:
+                # Trucks
+                if any(truck_model in model for truck_model in ['f-150', 'f150', 'silverado', 'sierra', 'ram', 'tacoma', 'tundra', 'ranger', 'colorado', 'canyon']):
+                    row_result["body_style"] = "truck"
+                    warnings.append("inferred_body_style_from_model")
+                # SUVs
+                elif any(suv_model in model for suv_model in ['cr-v', 'crv', 'rav4', 'highlander', 'pilot', 'explorer', 'escape', 'edge', 'x5', 'x3', 'q5', 'q7']):
+                    row_result["body_style"] = "suv"
+                    warnings.append("inferred_body_style_from_model")
+                # Sedans (common models)
+                elif any(sedan_model in model for sedan_model in ['camry', 'accord', 'altima', 'sentra', 'civic', 'corolla', 'fusion', 'malibu', 'impala', '3 series', 'c-class', 'a4', 'es350']):
+                    row_result["body_style"] = "sedan"
+                    warnings.append("inferred_body_style_from_model")
+                # Coupes
+                elif any(coupe_model in model for coupe_model in ['mustang', 'camaro', 'challenger', 'miata', 'z4']):
+                    row_result["body_style"] = "coupe"
+                    warnings.append("inferred_body_style_from_model")
+    
+    # Extract fuel_type if None
+    # Handle fragmented OCR text (e.g., "gas" might be split, "gasoline" might be "gas" + "oline")
+    # AND structured format: "Fuel: gasoline" or "Fuel Type: gas"
+    if row_result.get("fuel_type") is None:
+        # Try structured format first: "Fuel: X" or "Fuel Type: X" (case insensitive)
+        fuel_match = re.search(r'fuel(?:\s+type)?[:\s]+(\w+)', text_lower)
+        if fuel_match:
+            fuel_val = fuel_match.group(1).lower().strip()
+            if fuel_val in ['gas', 'gasoline', 'gasolin']:  # Handle truncated "gasolin"
+                row_result["fuel_type"] = "gasoline"
+                warnings.append("inferred_fuel_type_from_notes")
+            elif fuel_val in ['diesel', 'electric', 'hybrid']:
+                row_result["fuel_type"] = fuel_val
+                warnings.append("inferred_fuel_type_from_notes")
+        else:
+            # Try keyword search (including fragmented patterns and OCR errors)
+            # "gas" or "gasoline" - handle "gas" + "oline" fragmentation and "gasolin" + "ne"
+            # Also handle OCR errors like "gasolin" (missing 'e') and "gasolin ne" (fragmented)
+            # Improved patterns to catch more variations
+            if (re.search(r'\b(gas|gasoline|gasolin)\b', text_lower) or 
+                re.search(r'gas.*olin', text_lower) or 
+                re.search(r'gasolin', text_lower) or
+                re.search(r'gasolin[^a-z]', text_lower) or  # "gasolin" followed by non-letter (OCR truncation)
+                re.search(r'gasolin\s+ne', text_lower) or  # Fragmented: "gasolin ne" → "gasoline"
+                re.search(r'gas\s+olin', text_lower) or  # Fragmented: "gas olin" → "gasoline"
+                re.search(r'gas\s+ne', text_lower) or  # Very fragmented: "gas ne" (part of "gasoline")
+                re.search(r'gasolin[^a-z\s]', text_lower)):  # "gasolin" followed by punctuation
+                row_result["fuel_type"] = "gasoline"
+                warnings.append("inferred_fuel_type_from_notes")
+            elif re.search(r'\bdiesel\b', text_lower):
+                row_result["fuel_type"] = "diesel"
+                warnings.append("inferred_fuel_type_from_notes")
+            elif re.search(r'\belectric\b', text_lower):
+                row_result["fuel_type"] = "electric"
+                warnings.append("inferred_fuel_type_from_notes")
+            elif re.search(r'\bhybrid\b', text_lower):
+                row_result["fuel_type"] = "hybrid"
+                warnings.append("inferred_fuel_type_from_notes")
+        
+        # If still not found, try model-based inference (default to gasoline for most vehicles)
+        if row_result.get("fuel_type") is None:
+            make = (row_result.get("make") or row.get("make") or "").lower()
+            model = (row_result.get("model") or row.get("model") or "").lower()
+            
+            if make and model:
+                # Electric vehicles
+                if any(electric_model in model for electric_model in ['model 3', 'model s', 'model x', 'model y', 'leaf', 'bolt', 'id.4', 'ioniq']):
+                    row_result["fuel_type"] = "electric"
+                    warnings.append("inferred_fuel_type_from_model")
+                # Hybrid vehicles
+                elif any(hybrid_model in model for hybrid_model in ['prius', 'hybrid', 'rav4 hybrid', 'highlander hybrid']):
+                    row_result["fuel_type"] = "hybrid"
+                    warnings.append("inferred_fuel_type_from_model")
+                # Diesel (less common, but check)
+                elif any(diesel_model in model for diesel_model in ['diesel', 'tdi']):
+                    row_result["fuel_type"] = "diesel"
+                    warnings.append("inferred_fuel_type_from_model")
+                # Default to gasoline for most vehicles (if make/model present, likely gasoline)
+                else:
+                    row_result["fuel_type"] = "gasoline"
+                    warnings.append("inferred_fuel_type_from_model")
+    
+    # Extract transmission if None
+    # Handle fragmented OCR text (e.g., "automatic" might be "auto" + "matic")
+    if row_result.get("transmission") is None:
+        # Try "transmission: X" or "X transmission" pattern
+        trans_match = re.search(r'transmission[:\s]+(\w+)', text_lower)
+        if trans_match:
+            trans_val = trans_match.group(1).lower()
+            if trans_val in ['auto', 'automatic']:
+                row_result["transmission"] = "automatic"
+                warnings.append("inferred_transmission_from_notes")
+            elif trans_val == 'manual':
+                row_result["transmission"] = "manual"
+                warnings.append("inferred_transmission_from_notes")
+            elif trans_val == 'cvt':
+                row_result["transmission"] = "cvt"
+                warnings.append("inferred_transmission_from_notes")
+        else:
+            # Try keyword search (including fragmented patterns and "8-speed auto", "automatic transmission", etc.)
+            # "automatic" - handle "auto" + "matic" fragmentation
+            if re.search(r'\b(automatic|auto|automat)\b', text_lower) or re.search(r'auto.*matic', text_lower):
+                row_result["transmission"] = "automatic"
+                warnings.append("inferred_transmission_from_notes")
+            elif re.search(r'\bmanual\b', text_lower):
+                row_result["transmission"] = "manual"
+                warnings.append("inferred_transmission_from_notes")
+            elif re.search(r'\bcvt\b', text_lower):
+                row_result["transmission"] = "cvt"
+                warnings.append("inferred_transmission_from_notes")
+        
+        # If still not found, try model-based inference (default to automatic for most modern vehicles)
+        if row_result.get("transmission") is None:
+            make = (row_result.get("make") or row.get("make") or "").lower()
+            model = (row_result.get("model") or row.get("model") or "").lower()
+            year = row_result.get("year") or row.get("year")
+            
+            if make and model:
+                # Manual transmission indicators (usually in model name or trim)
+                if any(manual_indicator in model for manual_indicator in ['manual', 'mt', '6mt', '5mt']):
+                    row_result["transmission"] = "manual"
+                    warnings.append("inferred_transmission_from_model")
+                # CVT (usually in model description)
+                elif any(cvt_indicator in model for cvt_indicator in ['cvt']):
+                    row_result["transmission"] = "cvt"
+                    warnings.append("inferred_transmission_from_model")
+                # Default to automatic for most modern vehicles (especially if year >= 2000)
+                elif year and year >= 2000:
+                    row_result["transmission"] = "automatic"
+                    warnings.append("inferred_transmission_from_model")
+                # For older vehicles or if no year, still default to automatic (most common)
+                else:
+                    row_result["transmission"] = "automatic"
+                    warnings.append("inferred_transmission_from_model")
+    
+    # Extract mileage if None
+    # Handle fragmented OCR text (numbers might be split across lines, e.g., "12," + "345" = "12,345")
+    if row_result.get("mileage") is None:
+        # Try multiple patterns: "12,345 miles", "100245 miles", "odometer: 89,000", "about 45,210 miles"
+        # Also handle fragmented numbers (e.g., "100" + "245" = "100245")
+        # AND structured format: "Milage: 100,245" (note OCR typo "Milage" not "Mileage")
+        # Also handle numbers without commas: "Milage: 100245"
+        mileage_patterns = [
+            r'milage[:\s]+([\d,]+)',  # Structured format: "Milage: 100,245" (OCR typo) - case insensitive
+            r'mileage[:\s]+([\d,]+)',  # Structured format: "Mileage: 12,345"
+            r'(-?[\d,]+)\s*(?:miles?|mileage|mi)',  # "12,345 miles" or "100245 miles"
+            r'odometer[:\s]+([\d,]+)',  # "odometer: 89,000"
+            r'about\s+([\d,]+)\s*(?:miles?|mi)',  # "about 45,210 miles"
+            r'(-?[\d,]+)\s*(?:mages?|milage)',  # OCR typo: "mages" instead of "miles"
+            r'mileage[:\s]*(\d[\d,]*\d)',  # "Mileage: 12,345" or "Mileage 12345"
+            r'milage[:\s]*(\d+)',  # "Milage: 100245" (no commas) - case insensitive
+        ]
+        for pattern in mileage_patterns:
+            mileage_match = re.search(pattern, text_lower, re.IGNORECASE)
+            if mileage_match:
+                try:
+                    mileage_str = mileage_match.group(1).replace(',', '').replace(' ', '').strip()
+                    mileage_int = int(mileage_str)
+                    # Prefer larger numbers (likely the actual mileage, not fragments)
+                    if mileage_int >= 1000:  # Only accept if >= 1000 (reasonable minimum)
+                        row_result["mileage"] = mileage_int
+                        warnings.append("inferred_mileage_from_notes")
+                        break
+                except (ValueError, TypeError):
+                    continue
+        
+        # Fallback: Try to find any large number (4+ digits) that might be mileage
+        # Look for patterns like "12,345" or "12345" near "mileage" or "miles"
+        if row_result.get("mileage") is None:
+            # Search for numbers near mileage keywords (including OCR errors like "mages")
+            # Also handle "Milage:" (capital M, OCR typo) - make case insensitive
+            mileage_context_pattern = r'(?:mileage|miles?|mi|mages?|milage)[:\s]*([\d,]{4,})'
+            context_match = re.search(mileage_context_pattern, text_lower, re.IGNORECASE)
+            if context_match:
+                try:
+                    mileage_str = context_match.group(1).replace(',', '').replace(' ', '').strip()
+                    mileage_int = int(mileage_str)
+                    if 0 <= mileage_int <= 999999:
+                        row_result["mileage"] = mileage_int
+                        warnings.append("inferred_mileage_from_notes")
+                except (ValueError, TypeError):
+                    pass
+            
+            # Also search for numbers before mileage keywords (e.g., "100245 Mages")
+            if row_result.get("mileage") is None:
+                reverse_pattern = r'([\d,]{4,})\s*(?:mileage|miles?|mi|mages?|milage)'
+                reverse_match = re.search(reverse_pattern, text_lower, re.IGNORECASE)
+                if reverse_match:
+                    try:
+                        mileage_str = reverse_match.group(1).replace(',', '').replace(' ', '').strip()
+                        mileage_int = int(mileage_str)
+                        if 0 <= mileage_int <= 999999:
+                            row_result["mileage"] = mileage_int
+                            warnings.append("inferred_mileage_from_notes")
+                    except (ValueError, TypeError):
+                        pass
+            
+            # Last resort: Find largest number in text (likely mileage)
+            # But only if it's a reasonable mileage value (not a year like 2024)
+            if row_result.get("mileage") is None:
+                all_numbers = re.findall(r'(\d{4,})', text_lower.replace(',', '').replace(' ', ''))
+                if all_numbers:
+                    try:
+                        # Filter out years (1900-2100) and very large numbers
+                        candidates = [int(n) for n in all_numbers if 1000 <= int(n) <= 999999 and not (1900 <= int(n) <= 2100)]
+                        if candidates:
+                            largest = max(candidates)
+                            row_result["mileage"] = largest
+                            warnings.append("inferred_mileage_from_notes")
+                    except (ValueError, TypeError):
+                        pass
+    
+    # Extract color if None
+    # Handle fragmented OCR text, common OCR errors, AND structured format
+    if row_result.get("color") is None:
+        # First try structured format: "Color: Blue" or "Color Blue" (case insensitive)
+        # Make pattern more flexible to handle OCR variations and capitalization
+        structured_color_match = re.search(r'color[:\s]+([a-z]+)', text_lower)
+        if structured_color_match:
+            color_val = structured_color_match.group(1).lower().strip()
+            # Basic color list
+            basic_colors = ['blue', 'red', 'green', 'black', 'white', 'silver', 'gray', 'grey', 'yellow', 'orange', 'brown', 'purple', 'pink']
+            if color_val in basic_colors:
+                row_result["color"] = color_val.capitalize()
+                warnings.append("inferred_color_from_notes")
+            else:
+                # Try fuzzy matching for OCR errors in structured format (e.g., "Color: Bive" → "Blue")
+                color_mappings = {
+                    'blue': ['blue', 'bive', 'blu', 'blve', 'bule'],
+                    'red': ['red', 'ved', 're', 'rd'],
+                    'green': ['green', 'gre', 'grn', 'gren'],
+                }
+                for canonical_color, variants in color_mappings.items():
+                    if color_val in variants or any(v in color_val for v in variants if len(v) >= 3):
+                        row_result["color"] = canonical_color.capitalize()
+                        warnings.append("inferred_color_from_notes")
+                        break
+        
+        # If structured format didn't work, try "painted blue/red/green" pattern
+        if row_result.get("color") is None:
+            color_match = re.search(r'painted\s+(\w+)', text_lower)
+            if color_match:
+                color_val = color_match.group(1).lower()
+                # Basic color list
+                basic_colors = ['blue', 'red', 'green', 'black', 'white', 'silver', 'gray', 'grey', 'yellow', 'orange', 'brown', 'purple', 'pink']
+                if color_val in basic_colors:
+                    row_result["color"] = color_val.capitalize()
+                    warnings.append("inferred_color_from_notes")
+        
+        # If still not found, try direct color keywords (including OCR variations and fuzzy matching)
+        # Handle common OCR errors: "bive" -> "blue", "ved" -> "red", etc.
+        # Also handle fragmented OCR (e.g., "bl" + "ue" = "blue")
+        if row_result.get("color") is None:
+            color_mappings = {
+                'blue': ['blue', 'bive', 'blu', 'blve', 'bule', 'blve', 'bl', 'ue'],  # Added fragments
+                'red': ['red', 'ved', 're', 'rd', 'redd', 'ved'],  # "ved" is common OCR error
+                'green': ['green', 'gre', 'grn', 'gren', 'gree'],
+                'black': ['black', 'blac', 'blak', 'blck'],
+                'white': ['white', 'whit', 'whte', 'whit'],
+            }
+            for canonical_color, variants in color_mappings.items():
+                for variant in variants:
+                    # Try exact word boundary match first (most reliable)
+                    if len(variant) >= 3 and re.search(rf'\b{re.escape(variant)}\b', text_lower):
+                        row_result["color"] = canonical_color.capitalize()
+                        warnings.append("inferred_color_from_notes")
+                        break
+                    # Also try without word boundary for fragmented OCR (e.g., "bive" in "Color: Bive")
+                    if len(variant) >= 3 and variant in text_lower:
+                        row_result["color"] = canonical_color.capitalize()
+                        warnings.append("inferred_color_from_notes")
+                        break
+                if row_result.get("color"):
+                    break
+            
+            # If still not found, try remaining basic colors
+            if row_result.get("color") is None:
+                remaining_colors = ['silver', 'gray', 'grey', 'yellow', 'orange', 'brown', 'purple', 'pink']
+                for color in remaining_colors:
+                    if re.search(rf'\b{re.escape(color)}\b', text_lower) or color in text_lower:
+                        row_result["color"] = color.capitalize()
+                        warnings.append("inferred_color_from_notes")
+                        break
+    
+    # Extract owner_email if None - scan ALL fields, not just notes
+    if row_result.get("owner_email") is None:
+        # Email regex pattern
+        email_pattern = r'\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b'
+        
+        # Search in notes first
+        email_match = re.search(email_pattern, notes)
+        if email_match:
+            row_result["owner_email"] = email_match.group(0)
+            warnings.append("inferred_owner_email_from_notes")
+        else:
+            # Search in all row fields
+            for key, val in row.items():
+                if isinstance(val, str) and val:
+                    email_match = re.search(email_pattern, val)
+                    if email_match:
+                        row_result["owner_email"] = email_match.group(0)
+                        warnings.append("inferred_owner_email_from_fields")
+                        break
+    
+    return warnings
 
 def correct_vin_once(vin: Optional[str]) -> Optional[str]:
     """
@@ -316,6 +702,265 @@ def correct_vin_once(vin: Optional[str]) -> Optional[str]:
     
     return vin
 
+def repair_vin_with_confidence(
+    vin: Optional[str], 
+    original_vin: Optional[str] = None,
+    is_vision_extracted: bool = False,
+    is_ocr_extracted: bool = False
+) -> Tuple[Optional[str], float, List[str]]:
+    """
+    Repair VIN and return repaired value, confidence score, and warnings.
+    
+    Args:
+        vin: VIN value to repair
+        original_vin: Original VIN before any processing (for comparison)
+        is_vision_extracted: Whether VIN was extracted via Vision API
+        is_ocr_extracted: Whether VIN was extracted via OCR (PDF/IMAGE)
+    
+    Returns:
+        Tuple of (repaired_vin, confidence, warnings)
+        - repaired_vin: Repaired VIN (or None if can't be repaired)
+        - confidence: Confidence score (0.0-1.0)
+        - warnings: List of warning strings
+    """
+    if not vin or not isinstance(vin, str):
+        return vin, 0.0, ["vin_missing_or_invalid"]
+    
+    vin_upper = vin.upper().strip()
+    original_vin_upper = original_vin.upper().strip() if original_vin and isinstance(original_vin, str) else vin_upper
+    
+    confidence = 1.0
+    warnings = []
+    repaired = False
+    char_substitutions = 0
+    
+    # Apply source-based confidence penalty for OCR/Vision extraction
+    # This ensures OCR/Vision VINs never have perfect confidence, even if structurally valid
+    if is_vision_extracted or is_ocr_extracted:
+        confidence -= 0.1
+        if is_vision_extracted:
+            warnings.append("extracted_from_vision")
+        if is_ocr_extracted:
+            warnings.append("extracted_from_ocr")
+    
+    # Check length
+    if len(vin_upper) != 17:
+        warnings.append("vin_invalid_length")
+        # Try to extract 17-char VIN from the string
+        import re
+        vin_match = re.search(r'[A-HJ-NPR-Z0-9]{17}', vin_upper)
+        if vin_match:
+            vin_upper = vin_match.group(0)
+            repaired = True
+            confidence -= 0.3  # Severe repair needed
+            warnings.append("vin_length_repaired")
+        else:
+            # Can't repair - return with low confidence
+            return vin_upper, 0.3, warnings
+    
+    # Check for forbidden characters (I, O, Q)
+    invalid_chars = {'I', 'O', 'Q'}
+    found_invalid = [c for c in vin_upper if c in invalid_chars]
+    
+    if found_invalid:
+        warnings.append("vin_invalid_characters")
+        # Attempt repair
+        repaired_vin = vin_upper
+        for i, char in enumerate(vin_upper):
+            if char in invalid_chars:
+                if char == 'I':
+                    repaired_vin = repaired_vin[:i] + '1' + repaired_vin[i+1:]
+                    char_substitutions += 1
+                elif char == 'O':
+                    repaired_vin = repaired_vin[:i] + '0' + repaired_vin[i+1:]
+                    char_substitutions += 1
+                elif char == 'Q':
+                    repaired_vin = repaired_vin[:i] + '0' + repaired_vin[i+1:]
+                    char_substitutions += 1
+        
+        # Validate repaired VIN
+        if sum(c.isdigit() for c in repaired_vin) >= 2:
+            vin_upper = repaired_vin
+            repaired = True
+            # Reduce confidence for each character substitution
+            confidence -= 0.2 * char_substitutions
+            warnings.append(f"vin_characters_repaired_{char_substitutions}_substitutions")
+        else:
+            # Can't repair reliably
+            return vin_upper, 0.4, warnings
+    
+    # Check digit count
+    digit_count = sum(c.isdigit() for c in vin_upper)
+    if digit_count < 2:
+        warnings.append("vin_insufficient_digits")
+        # Try one more repair for digit count
+        for i, char in enumerate(vin_upper):
+            if char == 'S' and i > 0:
+                repaired_vin = vin_upper[:i] + '5' + vin_upper[i+1:]
+                if sum(c.isdigit() for c in repaired_vin) >= 2:
+                    vin_upper = repaired_vin
+                    repaired = True
+                    char_substitutions += 1
+                    confidence -= 0.2
+                    warnings.append("vin_digit_count_repaired")
+                    break
+            elif char == 'B' and i > 0:
+                repaired_vin = vin_upper[:i] + '8' + vin_upper[i+1:]
+                if sum(c.isdigit() for c in repaired_vin) >= 2:
+                    vin_upper = repaired_vin
+                    repaired = True
+                    char_substitutions += 1
+                    confidence -= 0.2
+                    warnings.append("vin_digit_count_repaired")
+                    break
+            elif char == 'Z' and i > 0:
+                repaired_vin = vin_upper[:i] + '7' + vin_upper[i+1:]
+                if sum(c.isdigit() for c in repaired_vin) >= 2:
+                    vin_upper = repaired_vin
+                    repaired = True
+                    char_substitutions += 1
+                    confidence -= 0.2
+                    warnings.append("vin_digit_count_repaired")
+                    break
+        
+        # If still can't repair, reduce confidence further
+        if digit_count < 2:
+            confidence = min(confidence, 0.4)
+    
+    # Ensure confidence doesn't go below 0.0
+    confidence = max(0.0, confidence)
+    
+    # If confidence is very low, add warning
+    if confidence < 0.5:
+        warnings.append("vin_low_confidence")
+    
+    return vin_upper, confidence, warnings
+
+def calculate_field_confidence(
+    field_name: str,
+    field_value: Any,
+    original_value: Any,
+    source_type: Optional[SourceType],
+    is_vision_extracted: bool = False,
+    is_ocr_extracted: bool = False,
+    was_repaired: bool = False,
+    repair_severity: str = "minor",  # "minor", "moderate", "severe"
+    char_substitutions: int = 0,
+    was_normalized: bool = False,  # Normalization (lowercase, trim) doesn't reduce confidence
+    allow_inferred_warnings: bool = False  # Only add extracted_from_ocr/vision warnings if True
+) -> Tuple[float, List[str]]:
+    """
+    Calculate confidence score for a field based on extraction source and repairs.
+    
+    Args:
+        field_name: Name of the field
+        field_value: Current field value
+        original_value: Original value before processing
+        source_type: Source type (PDF, IMAGE, etc.)
+        is_vision_extracted: Whether field was extracted via Vision API
+        is_ocr_extracted: Whether field was extracted via OCR
+        was_repaired: Whether value required repair
+        repair_severity: Severity of repair ("minor", "moderate", "severe")
+        char_substitutions: Number of character substitutions made
+        was_normalized: Whether value was normalized (lowercase, trim) - doesn't reduce confidence
+    
+    Returns:
+        Tuple of (confidence, warnings)
+        - confidence: Confidence score (0.0-1.0)
+        - warnings: List of warning strings
+    """
+    confidence = 1.0
+    warnings = []
+    
+    # Reduce confidence for Vision/OCR extraction
+    # Only add extraction warnings for vehicles and drivers (datasets that allow inferred warnings)
+    # Policies, claims, and relationships have curated warnings and should not get inferred warnings
+    if is_vision_extracted or is_ocr_extracted:
+        confidence -= 0.1
+        if allow_inferred_warnings:
+            if is_vision_extracted:
+                warnings.append("extracted_from_vision")
+            if is_ocr_extracted:
+                warnings.append("extracted_from_ocr")
+    
+    # Reduce confidence for repairs
+    if was_repaired:
+        if repair_severity == "minor":
+            confidence -= 0.2
+        elif repair_severity == "moderate":
+            confidence -= 0.25
+        elif repair_severity == "severe":
+            confidence -= 0.3
+        warnings.append(f"field_repaired_{repair_severity}")
+    
+    # Reduce confidence for character substitutions (OCR ambiguity)
+    if char_substitutions > 0:
+        confidence -= 0.2 * min(char_substitutions, 3)  # Cap at 3 substitutions
+        warnings.append(f"ocr_char_substitutions_{char_substitutions}")
+    
+    # Normalization (lowercasing, trimming) does NOT reduce confidence
+    # This is handled by was_normalized flag which is checked but doesn't affect confidence
+    
+    # Ensure confidence doesn't go below 0.0
+    confidence = max(0.0, confidence)
+    
+    # Add low confidence warning if needed
+    if confidence < 0.5:
+        warnings.append("low_confidence")
+    
+    return confidence, warnings
+
+def normalize_mileage(mileage: Any, current_confidence: Optional[float] = None, current_warnings: Optional[List[str]] = None) -> Tuple[Optional[int], float, List[str]]:
+    """
+    Normalize mileage value: convert negative to positive, handle non-numeric values.
+    
+    Rules:
+    1. If mileage is numeric and negative: convert to abs(), add warning, reduce confidence
+    2. If mileage is numeric and positive: keep as-is
+    3. If mileage is non-numeric or unparsable: return None with 0.0 confidence
+    
+    Args:
+        mileage: Mileage value (int, str, or None)
+        current_confidence: Current confidence score (if already calculated)
+        current_warnings: Current warnings list (if already populated)
+    
+    Returns:
+        Tuple of (normalized_mileage, confidence, warnings)
+        - normalized_mileage: Positive integer or None
+        - confidence: Confidence score (0.0-1.0)
+        - warnings: List of warning strings
+    """
+    warnings = list(current_warnings) if current_warnings else []
+    confidence = current_confidence if current_confidence is not None else 1.0
+    
+    # Handle None or empty values
+    if mileage is None or mileage == "":
+        return None, 0.0, warnings
+    
+    # Try to convert to integer
+    try:
+        if isinstance(mileage, str):
+            # Remove commas and whitespace
+            mileage_str = mileage.replace(",", "").replace(" ", "").strip()
+            mileage_int = int(mileage_str)
+        else:
+            mileage_int = int(mileage)
+        
+        # If negative, convert to positive and add warning
+        if mileage_int < 0:
+            normalized_mileage = abs(mileage_int)
+            if "negative_mileage" not in warnings:
+                warnings.append("negative_mileage")
+            # Reduce confidence slightly for negative mileage correction
+            confidence = max(0.0, confidence - 0.1)
+            return normalized_mileage, confidence, warnings
+        
+        # Positive mileage: keep as-is
+        return mileage_int, confidence, warnings
+    
+    except (ValueError, TypeError):
+        # Non-numeric or unparsable: return None
+        return None, 0.0, warnings
 
 def _generate_warnings(row_result: Dict[str, Any]) -> List[str]:
     """
@@ -336,13 +981,6 @@ def _generate_warnings(row_result: Dict[str, Any]) -> List[str]:
                 year_int = int(year) if isinstance(year, str) else year
                 if year_int < 1990 or year_int > 2035:
                     warnings.append("invalid_year")
-                    # #region agent log
-                    if row_result.get('vin') == 'ST420RJ98FDHKL4E':
-                        import json
-                        from datetime import datetime
-                        with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
-                            f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H5","location":"normalizer.py:198","message":"PDF Row 6: Warning generated","data":{"year":year,"year_int":year_int,"warnings":warnings},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
-                    # #endregion
             except (ValueError, TypeError):
                 # If year can't be converted to int, skip warning
                 pass
@@ -360,17 +998,10 @@ def _generate_warnings(row_result: Dict[str, Any]) -> List[str]:
         except (ValueError, TypeError):
             pass
     
-    # Negative mileage warning: if mileage is not None and mileage < 0
-    mileage = row_result.get("mileage")
-    if mileage is not None:
-        # Handle both int and string mileage values
-        try:
-            mileage_int = int(mileage) if isinstance(mileage, str) else mileage
-            if mileage_int < 0:
-                warnings.append("negative_mileage")
-        except (ValueError, TypeError):
-            # If mileage can't be converted to int, skip warning
-            pass
+    # Negative mileage warning: This is now handled by normalize_mileage() function
+    # which converts negative to positive and adds the warning.
+    # This check is kept for backward compatibility but should not be needed.
+    # (Mileage normalization happens before _generate_warnings is called)
     
     # Invalid email warning: basic check using pattern: value contains "@" and "." and no spaces
     # SAFEGUARD: Check email even if it's not a valid format (preserve invalid emails)
@@ -380,13 +1011,6 @@ def _generate_warnings(row_result: Dict[str, Any]) -> List[str]:
         # Check if it's a valid email format
         if email_str and ("@" not in email_str or "." not in email_str or " " in email_str):
             warnings.append("invalid_email")
-            # #region agent log
-            if row_result.get('vin') == 'ST420RJ98FDHKL4E':
-                import json
-                from datetime import datetime
-                with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
-                    f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H5","location":"normalizer.py:223","message":"PDF Row 6: Email warning generated","data":{"owner_email":owner_email,"email_str":email_str,"warnings":warnings},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
-            # #endregion
     
     # Transmission warning: allowed values are automatic, manual, cvt (case-insensitive)
     transmission = row_result.get("transmission")
@@ -437,7 +1061,6 @@ def _generate_warnings(row_result: Dict[str, Any]) -> List[str]:
             pass  # Skip if premium can't be converted to float
     
     return warnings
-
 
 def normalize_v2(
     source: Union[str, Dict, Path],
@@ -561,15 +1184,13 @@ def normalize_v2(
         
         # Extract raw data
         try:
-            logger.info(f"[DEBUG normalize_v2] Calling extract_from_source with extraction_source_type={extraction_source_type}, mapping_id={mapping_id}")
-            logger.debug(f"[normalize_v2] Calling extract_from_source with extraction_source_type={extraction_source_type}")
+            logger.debug(f"[normalize_v2] Calling extract_from_source with extraction_source_type={extraction_source_type}, mapping_id={mapping_id}")
             raw_data = extract_from_source(
                 source_dict,
                 source_type=extraction_source_type,
                 header_row_index=header_row_index,
                 mapping_id=mapping_id,
             )
-            logger.info(f"[DEBUG normalize_v2] extract_from_source returned {len(raw_data) if raw_data else 0} rows")
             logger.debug(f"[normalize_v2] Extracted {len(raw_data) if raw_data else 0} rows of raw data")
         except NotImplementedError as e:
             result["errors"].append({
@@ -589,6 +1210,7 @@ def normalize_v2(
             return result
         
         if not raw_data or len(raw_data) <= header_row_index:
+            logger.warning(f"[normalize_v2] No raw data extracted or data too short (len={len(raw_data) if raw_data else 0}, header_row_index={header_row_index})")
             result["success"] = True  # No data is not an error
             return result
         
@@ -596,14 +1218,24 @@ def normalize_v2(
         file_is_headerless = is_headerless_file(raw_data, header_row_index)
         rows = _prepare_rows(raw_data, header_row_index, file_is_headerless)
         
+        # Ensure rows is a list (never None)
+        if rows is None:
+            logger.warning("[normalize_v2] _prepare_rows returned None, setting to empty list")
+            rows = []
+        
+        logger.debug(f"[normalize_v2] Prepared {len(rows)} rows from {len(raw_data)} raw data rows (header_row_index={header_row_index})")
         result["total_rows"] = len(rows)
         
         # Process each row
+        logger.debug(f"[normalize_v2] Starting to process {len(rows)} rows")
         for row_idx, row in enumerate(rows, 1):
+            logger.debug(f"[normalize_v2] Processing row {row_idx}/{len(rows)}")
             row_result = {
                 "_source_id": mapping_id,
                 "_source_row_number": row_idx,
                 "_id": str(uuid.uuid4()),
+                "_warnings": [],  # Initialize _warnings early to ensure it always exists
+                "_confidence": {},  # Initialize _confidence early to ensure it always exists
             }
             row_errors = []
             
@@ -659,13 +1291,6 @@ def normalize_v2(
                     # creates vehicle dicts with keys matching VEHICLE_SCHEMA_ORDER
                     if target_field in row:
                         value = row.get(target_field)
-                        # #region agent log
-                        if row.get('vin') == 'ST420RJ98FDHKL4E' and target_field in ['year', 'make', 'model', 'color', 'owner_email', 'transmission']:
-                            import json
-                            from datetime import datetime
-                            with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
-                                f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H3","location":"normalizer.py:492","message":"PDF Row 6: Direct key match","data":{"target_field":target_field,"value":value,"row_has_key":target_field in row,"row_keys":list(row.keys())[:10]},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
-                        # #endregion
                     
                     # Strategy 2: Normalized match (fallback for edge cases)
                     if value is None or value == "":
@@ -801,9 +1426,8 @@ def normalize_v2(
                 value = _normalize_value(target_field, value)
                 
                 if format_spec:
-                    # TODO: Implement format specification logic
-                    # This may be used for date formatting, number formatting, etc.
-                    pass  # Format will be applied here once implemented
+                    # Format specification logic (not yet implemented)
+                    pass
                 
                 # Type conversion
                 # PRESERVE invalid values - do not set to None
@@ -936,13 +1560,6 @@ def normalize_v2(
                         row_result[target_field] = value
                     pass
                 # If both are None/empty, keep the existing None
-                # #region agent log - Enhanced debugging for PDF Row 6
-                if row.get('vin') == 'ST420RJ98FDHKL4E' and target_field in ['year', 'make', 'model', 'color', 'owner_email', 'transmission']:
-                    import json
-                    from datetime import datetime
-                    with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
-                        f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H4","location":"normalizer.py:753","message":"PDF Row 6: After mapping assignment","data":{"target_field":target_field,"value":value,"value_type":type(value).__name__,"row_result_value":row_result.get(target_field),"row_result_value_type":type(row_result.get(target_field)).__name__ if row_result.get(target_field) is not None else None,"row_has_key":target_field in row,"source_field":mapping.get("source_field"),"has_ai_instruction":bool(mapping.get("ai_instruction"))},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
-                # #endregion
             
             # SAFEGUARD: PRESERVE extracted values that mappings might have missed
             # For unstructured sources (PDF, raw text), values are already extracted in row dict
@@ -1003,24 +1620,43 @@ def normalize_v2(
                         row_result[matching_target] = val
                         preserved_fields.append(matching_target)
                         
-                        # #region agent log
-                        if row.get('vin') == 'ST420RJ98FDHKL4E' and matching_target in ['year', 'make', 'model', 'color', 'owner_email', 'transmission']:
-                            import json
-                            from datetime import datetime
-                            with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
-                                f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H4","location":"normalizer.py:799","message":"PDF Row 6: Safeguard preserved value","data":{"target_field":matching_target,"value":val,"current_value":current_value,"is_vision_extracted":is_vision_extracted},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
-                        # #endregion
             
             # CRITICAL FIX: For Vision-extracted rows, directly preserve ALL fields from row dict
             # This ensures fields extracted by Vision API (even if None) are preserved for warning generation
             # The safeguard above only preserves fields that match target_field in mappings,
             # but Vision-extracted rows should preserve ALL canonical fields regardless of mapping
             is_vision_extracted = row.get("_is_vision_extracted", False)
+            
+            # Determine domain type early (before VIN validation and field preservation)
+            # This needs to be done early so domain-specific logic can use these variables
+            domain_lower = mapping_id.lower()
+            is_relationship = 'relationship' in domain_lower or 'link' in domain_lower
+            is_claim = 'claim' in domain_lower and not is_relationship
+            is_location = 'location' in domain_lower and not is_relationship
+            is_policy = ('polic' in domain_lower) and not is_relationship and not is_claim
+            is_driver = ('driver' in domain_lower and not is_relationship and not is_claim) or "driver_id" in row_result
+            is_vehicle = not is_policy and not is_driver and not is_relationship and not is_claim and not is_location  # Default to vehicle
+            
             if is_vision_extracted:
                 # For Vision-extracted rows, directly copy all canonical fields from row to row_result
                 # This ensures fields are preserved even if they don't match any mapping target_field
-                from schema import VEHICLE_SCHEMA_ORDER
-                for field_name in VEHICLE_SCHEMA_ORDER:
+                from schema import VEHICLE_SCHEMA_ORDER, DRIVER_SCHEMA_ORDER, POLICY_SCHEMA_ORDER, CLAIM_SCHEMA_ORDER, LOCATION_SCHEMA_ORDER, RELATIONSHIP_SCHEMA_ORDER
+                
+                # Determine which schema to use based on domain
+                if is_driver:
+                    canonical_schema = DRIVER_SCHEMA_ORDER
+                elif is_policy:
+                    canonical_schema = POLICY_SCHEMA_ORDER
+                elif is_claim:
+                    canonical_schema = CLAIM_SCHEMA_ORDER
+                elif is_location:
+                    canonical_schema = LOCATION_SCHEMA_ORDER
+                elif is_relationship:
+                    canonical_schema = RELATIONSHIP_SCHEMA_ORDER
+                else:
+                    canonical_schema = VEHICLE_SCHEMA_ORDER
+                
+                for field_name in canonical_schema:
                     # Only set if not already set (mappings take priority)
                     if field_name not in row_result or row_result.get(field_name) is None:
                         row_value = row.get(field_name)
@@ -1045,6 +1681,16 @@ def normalize_v2(
                         row_result[field_name] = row_value
                         if row_value is not None and row_value != "":
                             preserved_fields.append(field_name)
+            
+            # CRITICAL FIX: For OCR-extracted driver rows, preserve notes field if it exists in row
+            # This ensures notes extracted by parse_driver_raw_text are preserved even if mapping didn't set them
+            if "driver_id" in row_result and not is_vision_extracted:
+                # For OCR-extracted drivers, preserve notes if it exists in row but not in row_result
+                if "notes" in row and row.get("notes") is not None and row.get("notes") != "":
+                    if "notes" not in row_result or row_result.get("notes") is None or row_result.get("notes") == "":
+                        row_result["notes"] = row.get("notes")
+                        if "notes" not in preserved_fields:
+                            preserved_fields.append("notes")
             
             # CRITICAL FIX: Apply transforms to ALL fields that have transforms, even if already set
             # This ensures transforms are applied even if values were set by merge operations or safeguards
@@ -1083,8 +1729,6 @@ def normalize_v2(
                     if row.get('vin') == 'ST420RJ98FDHKL4E':
                         import json
                         from datetime import datetime
-                        with open('/Users/alexaherrera/Desktop/table_detector/.cursor/debug.log', 'a') as f:
-                            f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"H5","location":"normalizer.py:860","message":"PDF Row 6: Missing critical fields after preservation","data":{"missing_critical":missing_critical,"preserved_fields":preserved_fields,"row_keys":list(row.keys())[:15],"row_values":{k:row.get(k) for k in missing_critical if k in row},"row_result_values":{k:row_result.get(k) for k in missing_critical}},"timestamp":int(datetime.now().timestamp()*1000)}) + '\n')
                     logger.warning(f"[normalize_v2] VIN {row.get('vin')}: Missing critical fields after preservation: {missing_critical}. Preserved fields: {preserved_fields}")
             
             # Apply fallback inference for fields that mapping missed
@@ -1108,6 +1752,219 @@ def normalize_v2(
             for key, val in preserved_before_inference.items():
                 if row_result.get(key) is None or row_result.get(key) == "":
                     row_result[key] = val
+            
+            # Post-Vision inference: Extract semantic fields from notes/text for Vision-extracted rows
+            # This fills missing fields (body_style, fuel_type, transmission, mileage, color, owner_email)
+            # by searching notes and all row fields for keywords/patterns
+            # BUT: Skip inference for table extractions (Vision is authoritative for tables)
+            # ALSO: Run inference for paragraph-extracted vehicles (parse_vehicle_raw_text) which have full OCR text in notes
+            # CRITICAL: Do NOT infer fields from free-form OCR for table-structured sources
+            # Only populate structured fields when a table is confidently detected; otherwise leave null with confidence 0.0
+            is_vision_extracted = row.get("_is_vision_extracted", False)
+            is_table_extraction = row.get("_is_table_extraction", False)
+            is_handwritten = row.get("_is_handwritten", False)
+            
+            # Check if notes contains full OCR text (paragraph-extracted vehicles)
+            # Paragraph-extracted vehicles have long notes with raw OCR patterns (e.g., "Vin:", "Year:", "Make:")
+            notes_text = row_result.get("notes") or row.get("notes") or ""
+            has_full_ocr_text = False
+            if isinstance(notes_text, str) and len(notes_text) > 100:
+                # Check for common OCR patterns that indicate full text block
+                ocr_patterns = ["Vin:", "Year:", "Make:", "Model:", "Milage:", "color:", "vin:", "year:", "make:", "model:"]
+                has_full_ocr_text = any(pattern in notes_text for pattern in ocr_patterns)
+            
+            # Determine if this is actually a table extraction (even if handwritten)
+            # Table extraction = Vision extracted structured data (VIN, year, make, model) with short/empty notes
+            # Free-form text = Vision extracted long notes or paragraph-extracted with full OCR text
+            is_actually_table = is_table_extraction
+            if is_vision_extracted and not is_table_extraction:
+                # Check if Vision extracted structured data (core fields populated) with short notes
+                # This indicates a table extraction, not free-form text
+                core_fields_populated = bool(row_result.get("vin") and row_result.get("year"))
+                notes_is_short = not notes_text or (isinstance(notes_text, str) and len(notes_text.strip()) < 50)
+                if core_fields_populated and notes_is_short:
+                    # This is actually a table extraction - Vision extracted structured data
+                    is_actually_table = True
+            
+            # Run inference ONLY for free-form text (not table extractions):
+            # - Paragraph-extracted vehicles with full OCR text (has_full_ocr_text)
+            # - Vision-extracted free-form text (NOT table extractions, with long notes)
+            # DO NOT run inference for table extractions (even if handwritten)
+            should_run_inference = False
+            if has_full_ocr_text:
+                # Paragraph-extracted with full OCR text - can infer
+                should_run_inference = True
+            elif is_vision_extracted and not is_actually_table:
+                # Vision-extracted free-form text (not a table) - can infer
+                # Check if notes are substantial (free-form text, not structured table)
+                if isinstance(notes_text, str) and len(notes_text.strip()) >= 50:
+                    should_run_inference = True
+            
+            if should_run_inference:
+                # Debug: Log what we're searching
+                notes_available = bool(row_result.get("notes") or row.get("notes"))
+                notes_preview = (row_result.get("notes") or row.get("notes") or "")[:100]
+                missing_fields = [f for f in ["body_style", "fuel_type", "transmission", "mileage", "color", "owner_email"] 
+                                if row_result.get(f) is None]
+                if missing_fields:
+                    extraction_type = "paragraph-extracted" if has_full_ocr_text and not is_vision_extracted else "Vision-extracted"
+                    logger.warning(f"[Post-Vision Inference] {extraction_type} row (VIN={row_result.get('vin')}): "
+                               f"notes_available={notes_available}, notes_preview='{notes_preview}', missing_fields={missing_fields}")
+                
+                inference_warnings = infer_fields_from_notes_for_vision(row_result, row)
+                # Add inference warnings to row_result warnings list
+                if inference_warnings:
+                    if "_warnings" not in row_result:
+                        row_result["_warnings"] = []
+                    row_result["_warnings"].extend(inference_warnings)
+                    logger.warning(f"[Post-Vision Inference] Inferred {len(inference_warnings)} field(s): {inference_warnings}")
+                
+                # Log what was inferred
+                inferred_fields = {f: row_result.get(f) for f in ["body_style", "fuel_type", "transmission", "mileage", "color", "owner_email"] 
+                                 if row_result.get(f) is not None and f in missing_fields}
+                if inferred_fields:
+                    logger.warning(f"[Post-Vision Inference] Inferred values: {inferred_fields}")
+            
+            # Initialize metadata structures (namespaced, not top-level)
+            if "_confidence" not in row_result:
+                row_result["_confidence"] = {}
+            if "_warnings" not in row_result:
+                row_result["_warnings"] = []
+            if "_flags" not in row_result:
+                row_result["_flags"] = {}
+            
+            # Centralized mileage normalization (applies to ALL extraction paths)
+            # This ensures negative mileage is converted to positive and flagged consistently
+            mileage_value = row_result.get("mileage")
+            normalized_mileage, mileage_confidence_base, mileage_warnings = normalize_mileage(
+                mileage_value,
+                current_confidence=None,  # Will be calculated later based on source
+                current_warnings=row_result.get("_warnings", [])
+            )
+            
+            # Update mileage value if it was normalized (negative -> positive)
+            if normalized_mileage is not None and mileage_value != normalized_mileage:
+                row_result["mileage"] = normalized_mileage
+            
+            # Add mileage warnings to general warnings list
+            for warning in mileage_warnings:
+                if warning not in row_result["_warnings"]:
+                    row_result["_warnings"].append(warning)
+            
+            # VIN validation and confidence scoring
+            # ONLY run for vehicle rows (not policies, drivers, etc.)
+            if is_vehicle:
+                vin = row_result.get("vin")
+                original_vin = row.get("vin")  # Get original before any processing
+                if vin and isinstance(vin, str):
+                    # Get source type information
+                    is_vision_extracted = row.get("_is_vision_extracted", False)
+                    is_ocr_extracted = actual_source_type in {SourceType.PDF, SourceType.IMAGE} and not is_vision_extracted
+                    
+                    # Repair VIN and get confidence + warnings
+                    # Pass source type info so OCR/Vision VINs get appropriate confidence penalty
+                    repaired_vin, vin_confidence, vin_warnings = repair_vin_with_confidence(
+                        vin, 
+                        original_vin,
+                        is_vision_extracted=is_vision_extracted,
+                        is_ocr_extracted=is_ocr_extracted
+                    )
+                    
+                    # Update VIN if repaired
+                    if repaired_vin != vin:
+                        row_result["vin"] = repaired_vin
+                        vin = repaired_vin
+                    
+                    # Store confidence in namespaced structure
+                    row_result["_confidence"]["vin"] = vin_confidence
+                    
+                    # Apply hard confidence ceiling for OCR/Vision sources
+                    # OCR/Vision VINs must never have confidence >= 0.9, even if structurally valid
+                    if (is_vision_extracted or is_ocr_extracted) and vin_confidence > 0.85:
+                        vin_confidence = 0.85
+                        row_result["_confidence"]["vin"] = vin_confidence
+                        if "vin_from_ocr_source" not in vin_warnings:
+                            vin_warnings.append("vin_from_ocr_source")
+                    
+                    # Determine if VIN requires human review (semantic risk flag)
+                    # This is a business safety layer, separate from confidence scoring
+                    vin_requires_human_review = False
+                    
+                    # Set to True if ANY of the following conditions are met:
+                    # 1. Source is OCR or Vision (unreliable extraction)
+                    if is_vision_extracted or is_ocr_extracted:
+                        vin_requires_human_review = True
+                    
+                    # 2. VIN was repaired or modified in repair_vin_with_confidence()
+                    if repaired_vin != vin:
+                        vin_requires_human_review = True
+                    
+                    # 3. VIN confidence is below high threshold (< 0.95)
+                    if vin_confidence < 0.95:
+                        vin_requires_human_review = True
+                    
+                    # 4. VIN does not exactly match the original extracted string
+                    if original_vin and repaired_vin.upper().strip() != original_vin.upper().strip():
+                        vin_requires_human_review = True
+                    
+                    # Store the flag in namespaced structure
+                    row_result["_flags"]["vin_requires_human_review"] = vin_requires_human_review
+                    
+                    # Add warning if human review is required (flag is source of truth)
+                    if vin_requires_human_review and "vin_requires_human_review" not in row_result["_warnings"]:
+                        row_result["_warnings"].append("vin_requires_human_review")
+                    
+                    # Add VIN warnings to general warnings list
+                    for warning in vin_warnings:
+                        if warning not in row_result["_warnings"]:
+                            row_result["_warnings"].append(warning)
+                elif vin is None:
+                    # VIN is missing
+                    row_result["_confidence"]["vin"] = 0.0
+                    # Missing VIN requires human review
+                    if "_flags" not in row_result:
+                        row_result["_flags"] = {}
+                    row_result["_flags"]["vin_requires_human_review"] = True
+                    if "vin_missing" not in row_result["_warnings"]:
+                        row_result["_warnings"].append("vin_missing")
+                    if "vin_requires_human_review" not in row_result["_warnings"]:
+                        row_result["_warnings"].append("vin_requires_human_review")
+            
+            # Driver ID validation and confidence scoring (mirror VIN logic)
+            driver_id = row_result.get("driver_id")
+            if driver_id and isinstance(driver_id, str) and "driver_id" in row_result:
+                # Get source type information
+                is_vision_extracted = row.get("_is_vision_extracted", False)
+                is_ocr_extracted = actual_source_type in {SourceType.PDF, SourceType.IMAGE} and not is_vision_extracted
+                
+                # For structured sources, driver_id should be high confidence
+                if actual_source_type in {SourceType.CSV, SourceType.XLSX, SourceType.AIRTABLE, SourceType.GOOGLE_SHEETS}:
+                    driver_id_confidence = 1.0
+                    driver_id_warnings = []
+                else:
+                    # For OCR/Vision sources, reduce confidence
+                    driver_id_confidence, driver_id_warnings = calculate_field_confidence(
+                        field_name="driver_id",
+                        field_value=driver_id,
+                        original_value=row.get("driver_id"),
+                        source_type=actual_source_type,
+                        is_vision_extracted=is_vision_extracted,
+                        is_ocr_extracted=is_ocr_extracted,
+                        was_repaired=False,
+                        repair_severity="minor",
+                        char_substitutions=0,
+                        was_normalized=False
+                    )
+                
+                row_result["_confidence"]["driver_id"] = driver_id_confidence
+                for warning in driver_id_warnings:
+                    if warning not in row_result["_warnings"]:
+                        row_result["_warnings"].append(warning)
+            elif "driver_id" in row_result and row_result.get("driver_id") is None:
+                # Missing driver_id
+                row_result["_confidence"]["driver_id"] = 0.0
+                if "driver_id_missing" not in row_result["_warnings"]:
+                    row_result["_warnings"].append("driver_id_missing")
             
             # Check required fields after all variants have been tried
             # Only check the first/primary required mapping for each target_field (avoid duplicates)
@@ -1237,12 +2094,14 @@ def normalize_v2(
             
             # Driver-specific normalization
             # Strip all string fields and convert empty strings to None
+            # CRITICAL: Preserve notes field - do not convert to None if it has content
             if "driver_id" in row_result:
                 for key, val in row_result.items():
                     if isinstance(val, str):
                         val = val.strip()
                         # Convert empty strings to None
-                        if val == "":
+                        # EXCEPTION: Preserve notes field even if empty (for OCR-extracted notes)
+                        if val == "" and key != "notes":
                             row_result[key] = None
                         else:
                             row_result[key] = val
@@ -1383,31 +2242,296 @@ def normalize_v2(
             if actual_source_type in {SourceType.PDF, SourceType.IMAGE} and row.get("_is_handwritten"):
                 promote_fields_from_notes(row_result)
             
-            # Correct VIN ONLY for handwritten OCR sources (NOT for Vision-extracted sources)
-            # Vision-extracted VINs should be preserved exactly as extracted (no correction)
-            if actual_source_type in {SourceType.PDF, SourceType.IMAGE} and row.get("_is_handwritten") and not row.get("_is_vision_extracted"):
-                vin = row_result.get("vin")
-                if vin:
-                    corrected_vin = correct_vin_once(vin)
-                    if corrected_vin != vin:
-                        row_result["vin"] = corrected_vin
+            # Note: VIN correction is now handled in the confidence scoring section above
+            # This section is kept for backward compatibility but VIN repair with confidence
+            # tracking happens in the VIN validation section
+            
+            # Calculate confidence scores for all fields (especially VIN, mileage, year)
+            # Track original values before processing for comparison
+            original_row = row.copy()
+            
+            # Get source type information
+            is_vision_extracted = row.get("_is_vision_extracted", False)
+            is_ocr_extracted = actual_source_type in {SourceType.PDF, SourceType.IMAGE} and not is_vision_extracted
+            
+            # Determine domain and use appropriate schema
+            mapping_id = mapping_config.get("id", "")
+            from schema import VEHICLE_SCHEMA_ORDER, DRIVER_SCHEMA_ORDER, POLICY_SCHEMA_ORDER
+            
+            # Detect domain type (check relationships first to avoid false matches)
+            domain_lower = mapping_id.lower()
+            is_relationship = 'relationship' in domain_lower or 'link' in domain_lower
+            is_claim = 'claim' in domain_lower and not is_relationship
+            is_location = 'location' in domain_lower and not is_relationship
+            is_policy = ('polic' in domain_lower) and not is_relationship and not is_claim
+            is_driver = 'driver' in domain_lower and not is_relationship and not is_claim
+            is_vehicle = not is_policy and not is_driver and not is_relationship and not is_claim and not is_location  # Default to vehicle
+            
+            if is_driver:
+                # Driver domain: use driver schema and priority fields
+                canonical_schema_fields = DRIVER_SCHEMA_ORDER.copy()
+                priority_fields = ["driver_id", "years_experience", "license_number"]
+            elif is_policy:
+                # Policy domain: use policy schema and priority fields
+                canonical_schema_fields = POLICY_SCHEMA_ORDER.copy()
+                priority_fields = ["policy_number", "insured_name", "effective_date"]
+            else:
+                # Vehicle domain (default): use vehicle schema and priority fields
+                canonical_schema_fields = VEHICLE_SCHEMA_ORDER.copy()
+                priority_fields = ["vin", "mileage", "year"]
+            
+            all_fields = list(row_result.keys())
+            
+            # Remove metadata fields (canonical schema fields only)
+            fields_to_score = [f for f in all_fields if f in canonical_schema_fields]
+            
+            # Process priority fields first, then others
+            fields_to_process = priority_fields + [f for f in fields_to_score if f not in priority_fields]
+            
+            for field_name in fields_to_process:
+                # Skip VIN/driver_id if already processed above
+                if field_name == "vin" and "vin" in row_result.get("_confidence", {}):
+                    continue
+                if field_name == "driver_id" and "driver_id" in row_result.get("_confidence", {}):
+                    continue
+                
+                if field_name not in row_result:
+                    continue
+                
+                field_value = row_result.get(field_name)
+                original_value = original_row.get(field_name)
+                
+                # Skip if value is None (missing fields get 0.0 confidence)
+                if field_value is None:
+                    row_result["_confidence"][field_name] = 0.0
+                    # Only generate missing warnings for required fields
+                    # For policies, all fields are optional, so don't generate warnings
+                    # For vehicles/drivers, only generate warnings for critical fields
+                    if is_policy:
+                        # Policies: all fields are optional, no missing warnings
+                        pass
+                    elif is_vehicle and field_name in ["vin"]:
+                        # Vehicles: only warn for missing VIN (critical field)
+                        if f"{field_name}_missing" not in row_result["_warnings"]:
+                            row_result["_warnings"].append(f"{field_name}_missing")
+                    elif is_driver and field_name in ["driver_id"]:
+                        # Drivers: only warn for missing driver_id (critical field)
+                        if f"{field_name}_missing" not in row_result["_warnings"]:
+                            row_result["_warnings"].append(f"{field_name}_missing")
+                    # For other domains or optional fields, don't generate warnings
+                    continue
+                
+                # Special handling for mileage: use pre-calculated confidence from normalization
+                # (mileage_confidence_base was set during normalization above)
+                field_confidence_base = mileage_confidence_base if field_name == "mileage" else None
+                
+                # Check if value was repaired (compare original to current)
+                was_repaired = False
+                repair_severity = "minor"
+                char_substitutions = 0
+                was_normalized = False
+                
+                if original_value is not None and original_value != field_value:
+                    # Value changed - determine if it was a repair or normalization
+                    original_str = str(original_value).strip()
+                    current_str = str(field_value).strip()
+                    
+                    # Check if it's just normalization (case change, whitespace) - doesn't reduce confidence
+                    was_normalized = (
+                        original_str.lower() == current_str.lower() or
+                        original_str.upper() == current_str.upper() or
+                        original_str.strip() == current_str
+                    )
+                    
+                    if not was_normalized:
+                        # It's a repair, not just normalization
+                        was_repaired = True
+                        
+                        # Count character substitutions (for mileage, year)
+                        if field_name in ["mileage", "year"]:
+                            # Check for OCR character substitutions
+                            if isinstance(original_value, str) and isinstance(field_value, (str, int)):
+                                # Count substitutions (I→1, O→0, etc.)
+                                original_upper = original_str.upper()
+                                current_upper = str(current_str).upper()
+                                substitutions = {
+                                    ('I', '1'), ('O', '0'), ('Q', '0'),
+                                    ('S', '5'), ('B', '8'), ('Z', '7')
+                                }
+                                for old_char, new_char in substitutions:
+                                    if old_char in original_upper and new_char in current_upper:
+                                        char_substitutions += original_upper.count(old_char)
+                            
+                            # Determine repair severity
+                            if char_substitutions > 0:
+                                repair_severity = "moderate"
+                            else:
+                                repair_severity = "minor"
+                
+                # Calculate confidence
+                # For mileage, start from the base confidence calculated during normalization
+                if field_name == "mileage" and field_confidence_base is not None:
+                    # Start from normalized confidence, then apply source-based adjustments
+                    # The normalize_mileage function already reduced confidence for negative values
+                    # Now apply source-based adjustments (Vision/OCR extraction)
+                    source_adjustment = 0.0
+                    if is_vision_extracted or is_ocr_extracted:
+                        source_adjustment = -0.1
+                    field_confidence = max(0.0, field_confidence_base + source_adjustment)
+                    field_warnings = []  # Warnings already added during normalization
+                else:
+                    # Standard confidence calculation for other fields
+                    # Only allow inferred warnings (extracted_from_ocr, extracted_from_vision) for vehicles and drivers
+                    allow_inferred_warnings = is_vehicle or is_driver
+                    field_confidence, field_warnings = calculate_field_confidence(
+                        field_name=field_name,
+                        field_value=field_value,
+                        original_value=original_value,
+                        source_type=actual_source_type,
+                        is_vision_extracted=is_vision_extracted,
+                        is_ocr_extracted=is_ocr_extracted,
+                        was_repaired=was_repaired,
+                        repair_severity=repair_severity,
+                        char_substitutions=char_substitutions,
+                        was_normalized=was_normalized,
+                        allow_inferred_warnings=allow_inferred_warnings
+                    )
+                
+                # Store confidence in namespaced structure
+                row_result["_confidence"][field_name] = field_confidence
+                
+                # Add field warnings to general warnings list
+                for warning in field_warnings:
+                    if warning not in row_result["_warnings"]:
+                        row_result["_warnings"].append(warning)
+            
+            # Ensure ALL schema fields have confidence scores (for structured sources)
+            # This mirrors vehicle behavior where all fields get confidence
+            mapping_id = mapping_config.get("id", "")
+            if is_driver:
+                from schema import DRIVER_SCHEMA_ORDER
+                # For structured sources, set default confidence for ALL schema fields
+                if actual_source_type in {SourceType.CSV, SourceType.XLSX, SourceType.AIRTABLE, SourceType.GOOGLE_SHEETS}:
+                    for field_name in DRIVER_SCHEMA_ORDER:
+                        # Ensure field exists in row_result (even if None)
+                        if field_name not in row_result:
+                            row_result[field_name] = None
+                        
+                        # Set confidence if not already set by confidence calculation loop
+                        if field_name not in row_result.get("_confidence", {}):
+                            # Check if field has a value
+                            if row_result.get(field_name) is not None:
+                                # Field exists with value - should have been processed by confidence loop
+                                # If not, set default confidence for structured sources
+                                row_result["_confidence"][field_name] = 0.33
+                            else:
+                                # Field is None - set 0.0 confidence
+                                row_result["_confidence"][field_name] = 0.0
+                                # Only warn for missing driver_id (critical field)
+                                if field_name == "driver_id" and f"{field_name}_missing" not in row_result.get("_warnings", []):
+                                    row_result["_warnings"].append(f"{field_name}_missing")
+            elif is_policy:
+                from schema import POLICY_SCHEMA_ORDER
+                # For structured sources, set default confidence for ALL schema fields
+                if actual_source_type in {SourceType.CSV, SourceType.XLSX, SourceType.AIRTABLE, SourceType.GOOGLE_SHEETS}:
+                    for field_name in POLICY_SCHEMA_ORDER:
+                        # Ensure field exists in row_result (even if None)
+                        if field_name not in row_result:
+                            row_result[field_name] = None
+                        
+                        # Set confidence if not already set by confidence calculation loop
+                        if field_name not in row_result.get("_confidence", {}):
+                            # Check if field has a value
+                            if row_result.get(field_name) is not None:
+                                # Field exists with value - should have been processed by confidence loop
+                                # If not, set default confidence for structured sources
+                                row_result["_confidence"][field_name] = 0.33
+                            else:
+                                # Field is None - set 0.0 confidence
+                                # Policies: all fields are optional, so don't generate missing warnings
+                                row_result["_confidence"][field_name] = 0.0
             
             # Add warnings for data quality issues
-            row_result["_warnings"] = _generate_warnings(row_result)
+            # Merge warnings instead of overwriting (preserve existing warnings from confidence calculation)
+            existing_warnings = row_result.get("_warnings", [])
+            if not isinstance(existing_warnings, list):
+                existing_warnings = []
+            
+            # Generate validation warnings for vehicles, drivers, and policies
+            # _generate_warnings only creates validation warnings (invalid_date_range, negative_premium, etc.)
+            # It does NOT create inferred warnings (extracted_from_ocr, extracted_from_vision) - those come from calculate_field_confidence
+            # Claims and relationships should NOT get validation warnings (they have curated warnings only)
+            try:
+                if is_vehicle or is_driver or is_policy:
+                    # Generate validation warnings for vehicles, drivers, and policies
+                    new_warnings = _generate_warnings(row_result)
+                else:
+                    # For claims and relationships: preserve existing warnings only (no validation warnings)
+                    new_warnings = []
+                
+                # Merge warnings, preserving existing ones
+                all_warnings = list(existing_warnings)
+                for warning in new_warnings:
+                    if warning not in all_warnings:
+                        all_warnings.append(warning)
+                row_result["_warnings"] = all_warnings
+            except Exception as e:
+                # If warning handling fails, log and continue with existing warnings
+                logger.error(f"[normalize_v2] Warning handling failed for row {row_idx}: {e}", exc_info=True)
+                # Just ensure _warnings exists
+                if "_warnings" not in row_result:
+                    row_result["_warnings"] = existing_warnings if isinstance(existing_warnings, list) else []
+            
+            # Add _source metadata structure (namespaced, not top-level)
+            # Determine parser type
+            parser = "unknown"
+            if is_vision_extracted:
+                parser = "vision_api"
+            elif actual_source_type == SourceType.PDF:
+                parser = "parse_vehicle_raw_text"  # Paragraph-based extraction
+            elif actual_source_type == SourceType.IMAGE:
+                parser = "ocr_extraction"
+            elif actual_source_type in {SourceType.CSV, SourceType.XLSX, SourceType.AIRTABLE, SourceType.GOOGLE_SHEETS}:
+                parser = "structured_loader"
+            elif actual_source_type == SourceType.RAW_TEXT:
+                parser = "raw_text_parser"
+            
+            # Determine OCR engine (if applicable)
+            ocr_engine = None
+            if actual_source_type in {SourceType.PDF, SourceType.IMAGE}:
+                # Check if row has OCR metadata
+                if "_ocr_engine" in row:
+                    ocr_engine = row.get("_ocr_engine")
+                elif is_vision_extracted:
+                    ocr_engine = "vision_api"
+                else:
+                    ocr_engine = "tesseract"  # Default OCR engine
+            
+            # Build _source metadata
+            row_result["_source"] = {
+                "source_type": actual_source_type.value if hasattr(actual_source_type, 'value') else str(actual_source_type),
+                "parser": parser,
+                "ocr_engine": ocr_engine,
+                "is_table_extraction": is_table_extraction
+            }
             
             # Add row to results
             # When validate=False, include all rows even if they have errors
+            logger.debug(f"[normalize_v2] Row {row_idx} processed, {len(row_errors)} errors, adding to result")
             if row_errors:
                 result["errors"].extend(row_errors)
                 result["total_errors"] += 1
                 # Still add row to data when validate=False
                 if not validate:
                     result["data"].append(row_result)
+                    logger.debug(f"[normalize_v2] Row {row_idx} added to result (with errors, validate=False)")
             else:
                 result["data"].append(row_result)
                 result["total_success"] += 1
+                logger.debug(f"[normalize_v2] Row {row_idx} added to result (no errors)")
         
         # Reorder rows by domain
+        logger.debug(f"[normalize_v2] Before reorder: {len(result['data'])} rows")
         mapping_id = mapping_config.get("id", "")
         if "policies" in mapping_id.lower():
             result["data"] = reorder_all_policies(result["data"])
@@ -1419,6 +2543,7 @@ def normalize_v2(
             result["data"] = reorder_all_relationships(result["data"])
         elif "claim" in mapping_id.lower():
             result["data"] = reorder_all_claims(result["data"])
+        logger.debug(f"[normalize_v2] After reorder: {len(result['data'])} rows")
         
         result["success"] = result["total_errors"] == 0
         return result
@@ -1431,7 +2556,6 @@ def normalize_v2(
             "error": f"Normalization failed: {str(e)}"
         })
         return result
-
 
 def normalize_from_mapping_id(
     source: Union[str, Dict, Path],

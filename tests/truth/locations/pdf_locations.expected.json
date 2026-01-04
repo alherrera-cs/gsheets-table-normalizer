@@ -1,7 +1,7 @@
 {
     "__schema__": [
       "location_id",
-      "named_insured",
+      "insured_name",
       "address_line_1",
       "city",
       "state",
@@ -16,7 +16,7 @@
     "rows": [
       {
         "location_id": "L001",
-        "named_insured": "John and Jane Doe",
+        "insured_name": "John and Jane Doe",
         "address_line_1": "123 Main St",
         "city": "Los Angeles",
         "state": "CA",
@@ -31,7 +31,7 @@
       },
       {
         "location_id": "L002",
-        "named_insured": "Alex Smith",
+        "insured_name": "Alex Smith",
         "address_line_1": "500 Elm St",
         "city": "Dallas",
         "state": "TX",

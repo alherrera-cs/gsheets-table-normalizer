@@ -36,6 +36,11 @@ def parse_text_blocks(
     
     # Filter by confidence
     filtered = [block for block in text_blocks if block.confidence >= min_confidence]
+    filtered_count = len(filtered)
+    total_count = len(text_blocks)
+    if filtered_count < total_count:
+        avg_confidence = sum(b.confidence for b in text_blocks) / total_count if text_blocks else 0.0
+        logger.debug(f"[parser] Filtered {total_count - filtered_count} blocks (confidence < {min_confidence}), avg confidence: {avg_confidence:.2f}")
     
     # Sort by position (top-to-bottom, left-to-right)
     # Primary sort: y_min (top to bottom)
@@ -48,7 +53,7 @@ def parse_text_blocks(
     # Assign line numbers based on y-position clustering
     _assign_line_numbers(sorted_blocks)
     
-    logger.info(f"Parsed {len(sorted_blocks)} text blocks from {len(text_blocks)} raw blocks")
+    logger.debug(f"[parser] Parsed {len(sorted_blocks)} text blocks from {len(text_blocks)} raw blocks")
     return sorted_blocks
 
 
@@ -73,7 +78,7 @@ def detect_table_candidates(
     if not text_blocks:
         return []
     
-    logger.info(f"[OCR] Detecting table candidates from {len(text_blocks)} text blocks")
+    logger.debug(f"[OCR] Detecting table candidates from {len(text_blocks)} text blocks")
     
     # Group blocks by rows
     rows = _group_blocks_by_row(text_blocks, row_threshold=20.0)
@@ -122,7 +127,7 @@ def detect_table_candidates(
         )
         
         candidates.append(candidate)
-        logger.info(f"[OCR] Detected table candidate: {len(cells)} rows x {len(column_positions)} cols (confidence: {confidence:.2f})")
+        logger.debug(f"[OCR] Detected table candidate: {len(cells)} rows x {len(column_positions)} cols (confidence: {confidence:.2f})")
     
     return candidates
 

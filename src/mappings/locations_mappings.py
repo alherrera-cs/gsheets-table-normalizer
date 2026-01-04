@@ -345,6 +345,34 @@ LOCATIONS_MAPPINGS = [
                 "type": "decimal",
                 "required": False,
                 "ai_instruction": "Extract the longitude coordinate from the document. Look for labels like 'Longitude', 'Lon', 'Lng', or longitude values (decimal numbers between -180 and 180) in location information."
+            },
+            {
+                "target_field": "insured_name",
+                "source_field": "",
+                "type": "string",
+                "required": False,
+                "ai_instruction": "Extract the named insured or insured name from the document. Look for labels like 'Named Insured', 'Insured Name', or names associated with the location."
+            },
+            {
+                "target_field": "territory_code",
+                "source_field": "",
+                "type": "string",
+                "required": False,
+                "ai_instruction": "Extract the territory code from the document. Look for labels like 'Territory Code', 'Territory', or territory identifiers (alphanumeric codes) in location information."
+            },
+            {
+                "target_field": "protection_class",
+                "source_field": "",
+                "type": "integer",
+                "required": False,
+                "ai_instruction": "Extract the protection class from the document. Look for labels like 'Protection Class', 'Protection', or numeric values (typically 1-10) representing the protection class."
+            },
+            {
+                "target_field": "notes",
+                "source_field": "",
+                "type": "string",
+                "required": False,
+                "ai_instruction": "Extract any additional notes or information from the document. Only extract if there is an explicit 'Notes:' field or section."
             }
         ]
     },

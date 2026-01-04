@@ -44,13 +44,18 @@ def extract_tables_from_blocks(
     
     # Extract raw text
     raw_text = _extract_raw_text(text_blocks)
+    logger.debug(f"[table_extract] Extracted raw text ({len(raw_text)} chars), preview: {raw_text[:300]}")
     
     # If table candidates are provided, use them
     if table_candidates:
         rows = _extract_rows_from_candidates(table_candidates)
+        logger.debug(f"[table_extract] Extracted {len(rows)} rows from {len(table_candidates)} table candidates")
     else:
         # Fallback: attempt to extract tables from text blocks directly
         rows = _extract_rows_from_blocks(text_blocks)
+        logger.debug(f"[table_extract] Extracted {len(rows)} rows directly from {len(text_blocks)} text blocks (no table candidates)")
+        if rows:
+            logger.debug(f"[table_extract] First row sample: {list(rows[0].keys()) if rows[0] else 'empty'}")
     
     result = OCRResult(
         rows=rows,
@@ -60,7 +65,7 @@ def extract_tables_from_blocks(
         table_candidates=table_candidates or []
     )
     
-    logger.info(f"Extracted {len(rows)} rows from {len(text_blocks)} text blocks")
+    logger.debug(f"[table_extract] Final result: {len(rows)} rows from {len(text_blocks)} text blocks")
     return result
 
 
@@ -94,7 +99,13 @@ def _extract_raw_text(text_blocks: List[TextBlock]) -> str:
             current_line = line_num
         lines.append(block.text)
     
-    return "\n".join(lines)
+    full_text = "\n".join(lines)
+    # Log if text seems suspiciously short or fragmented
+    if len(full_text) < 200 and len(sorted_blocks) > 20:
+        sample_blocks = [b.text[:20] for b in sorted_blocks[:10]]
+        logger.debug(f"[table_extract] Suspiciously short text ({len(full_text)} chars) from {len(sorted_blocks)} blocks. Sample blocks: {sample_blocks}")
+    
+    return full_text
 
 
 def _extract_rows_from_candidates(candidates: List[TableCandidate]) -> List[Dict[str, Any]]:
@@ -216,7 +227,7 @@ def _extract_rows_from_blocks(text_blocks: List[TextBlock]) -> List[Dict[str, An
         
         rows.append(row_dict)
     
-    logger.info(f"[OCR] Extracted {len(rows)} rows directly from {len(text_blocks)} text blocks")
+    logger.debug(f"[OCR] Extracted {len(rows)} rows directly from {len(text_blocks)} text blocks")
     return rows
 
 

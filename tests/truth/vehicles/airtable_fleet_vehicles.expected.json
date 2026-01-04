@@ -111,7 +111,7 @@
       "effective_date": null,
       "notes": null,
       "color": "Green",
-      "mileage": -100,
+      "mileage": 100,
       "trim": "S",
       "body_style": "crossover",
       "fuel_type": "gasoline",
